@@ -7,7 +7,7 @@
 
 **What is it?** `pulpgen` is a command-line tool that uses AI (Google Gemini) to automatically write a complete first-draft novel based on your idea/prompt. It handles outlining, chapter writing, and interactive AI-assisted editing.
 
-
+![screenshot](screenshot.png)
 
 ---
 
