@@ -1,17 +1,8 @@
 # -*- coding: utf-8 -*-
-import google.generativeai as genai
-from google.generativeai import types
-
-# Import specific exceptions for better handling
-from google.api_core import exceptions as google_api_exceptions
-
-import xml.etree.ElementTree as ET
-from xml.dom import minidom  # For pretty printing XML
 import os
 import argparse
-
-# import json # Logging removed
-from datetime import datetime
+import xml.etree.ElementTree as ET
+from xml.dom import minidom  # For pretty printing XML
 import uuid
 from pathlib import Path
 import time
@@ -21,26 +12,42 @@ import json
 import getpass
 import unicodedata  # For slugify
 import math  # For word count display
+from datetime import datetime
+from html import escape  # For HTML generation
 
+# API Client Libraries (Import conditionally later if preferred, but fine here)
+import google.generativeai as genai
+from google.generativeai import types as gemini_types
+from google.api_core import exceptions as google_api_exceptions
+import openai # Requires `pip install openai`
+
+# Rich for UI
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm, IntPrompt
 from rich.table import Table
 from rich.syntax import Syntax
 from rich.progress import Progress, SpinnerColumn, TextColumn
+
+# Environment Variables
 from dotenv import load_dotenv
-from html import escape  # For HTML generation
 
 # --- Configuration ---
-WRITING_MODEL_NAME = "gemini-2.5-pro-exp-03-25"
-WRITING_MODEL_CONFIG = types.GenerationConfig(
-    temperature=1,
-    max_output_tokens=65536,  # Standard max for 1.5 Pro
-    top_p=0.95,
-    top_k=40,
-    # stop_sequences=["</patch>"] # Stop sequence might be useful here
-)
-# LOG_FILE = "novel_writer_log.jsonl" # Logging removed
+# Default model names (can be overridden by args)
+DEFAULT_GEMINI_MODEL = "gemini-1.5-pro-latest" # Use latest 1.5 Pro as a good default
+DEFAULT_OPENAI_MODEL = "gpt-4o" # Use GPT-4o as a good default
+
+# Default Generation Config Parameters (used by both APIs where applicable)
+DEFAULT_TEMPERATURE = 1.0
+# Increased max output tokens as requested
+DEFAULT_MAX_OUTPUT_TOKENS = 65536 # Note: Actual output depends on model limits & context window.
+DEFAULT_TOP_P = 0.95
+# Gemini specific
+DEFAULT_TOP_K = 40
+# OpenAI specific (can be added if needed, None means default)
+# DEFAULT_FREQUENCY_PENALTY = None
+# DEFAULT_PRESENCE_PENALTY = None
+
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 DATE_FORMAT_FOR_FOLDER = "%Y%m%d"
 # --- API Retry Configuration ---
@@ -51,18 +58,7 @@ API_RETRY_BACKOFF_FACTOR = 2  # Base seconds for backoff (e.g., 2s, 4s, 8s)
 console = Console()
 
 # --- Helper Functions ---
-
-# Logging functions removed
-# def setup_logging(): ...
-# def log_interaction(log_data): ...
-
-
-def _count_words(text):
-    """Simple word counter."""
-    if not text or not text.strip():
-        return 0
-    return len(text.split())
-
+# ... (slugify, pretty_xml, _count_words - unchanged) ...
 
 def slugify(value, allow_unicode=False):
     """
@@ -98,21 +94,30 @@ def pretty_xml(elem):
         # Fallback to basic tostring
         return ET.tostring(elem, encoding="unicode")
 
+def _count_words(text):
+    """Simple word counter."""
+    if not text or not text.strip():
+        return 0
+    return len(text.split())
 
 def clean_llm_xml_output(xml_string):
     """Attempts to clean potential markdown/text surrounding LLM XML output."""
     if not isinstance(xml_string, str):
         return ""  # Handle None or other types
-    # Basic cleaning: find the first '<' and last '>'
-    start = xml_string.find("<")
-    end = xml_string.rfind(">")
-    if start != -1 and end != -1:
-        cleaned = xml_string[start : end + 1].strip()
-        # Remove potential markdown code fences
-        cleaned = re.sub(r"^```xml\s*", "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-        return cleaned
-    return xml_string  # Return original if no tags found
+
+    # 1. Remove markdown code fences first (making language optional)
+    # Apply strip() before regex to handle leading/trailing spaces around the whole block
+    cleaned = re.sub(r"^```(.*)?\s*", "", xml_string.strip(), flags=re.MULTILINE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    # 2. Strip leading/trailing whitespace again after fence removal
+    cleaned = cleaned.strip()
+
+    # 3. We will rely on ET.fromstring to handle potential remaining non-XML
+    #    content before the root element (like <?xml...?> directives or comments).
+    #    Aggressively searching for '<' and '>' might truncate valid XML.
+
+    return cleaned
 
 
 def parse_xml_string(xml_string, expected_root_tag="patch", attempt_clean=True):
@@ -125,27 +130,30 @@ def parse_xml_string(xml_string, expected_root_tag="patch", attempt_clean=True):
         console.print("[bold red]Error: Received empty XML string from LLM.[/bold red]")
         return None
 
+    cleaned_xml_string = xml_string # Keep original for error display
     if attempt_clean:
-        xml_string = clean_llm_xml_output(xml_string)
+        cleaned_xml_string = clean_llm_xml_output(xml_string)
 
-    if not xml_string.strip():
+    if not cleaned_xml_string.strip():
         console.print("[bold red]Error: XML string is empty after cleaning.[/bold red]")
         return None
 
     try:
-        # Attempt to wrap with <patch> ONLY if expecting a patch and it's missing
-        if expected_root_tag == "patch" and not xml_string.strip().startswith(
-            "<patch>"
-        ):
+        # Attempt to wrap with expected_root_tag ONLY if expecting a patch and it's missing
+        # More robust check: only wrap if it doesn't look like a complete XML doc already
+        if expected_root_tag == "patch" and \
+           not cleaned_xml_string.strip().startswith(f"<{expected_root_tag}>") and \
+           not cleaned_xml_string.strip().startswith("<?xml"):
             # Check if it looks like chapter content fragments
-            if "<chapter" in xml_string and "</chapter>" in xml_string:
+            # This heuristic might need refinement
+            if "<chapter" in cleaned_xml_string and "</chapter>" in cleaned_xml_string:
                 console.print(
-                    "[yellow]Warning: LLM output seems to be missing root <patch> tag for chapters, attempting to wrap.[/yellow]"
+                    f"[yellow]Warning: LLM output seems to be missing root <{expected_root_tag}> tag for chapters, attempting to wrap.[/yellow]"
                 )
-                xml_string = f"<patch>{xml_string}</patch>"
+                cleaned_xml_string = f"<{expected_root_tag}>{cleaned_xml_string}</{expected_root_tag}>"
             # Add more heuristics if needed for other patch types
 
-        return ET.fromstring(xml_string)
+        return ET.fromstring(cleaned_xml_string)
     except ET.ParseError as e:
         console.print(
             f"[bold red]Error parsing XML (expecting <{expected_root_tag}>):[/bold red] {e}"
@@ -157,9 +165,10 @@ def parse_xml_string(xml_string, expected_root_tag="patch", attempt_clean=True):
         if match:
             line_num, col_num = int(match.group(1)), int(match.group(2))
 
+        # Display the *cleaned* string when showing context
         console.print("[yellow]Attempted to parse:[/yellow]")
         if line_num > 0:
-            lines = xml_string.splitlines()
+            lines = cleaned_xml_string.splitlines()
             context_start = max(0, line_num - 3)
             context_end = min(len(lines), line_num + 2)
             for i in range(context_start, context_end):
@@ -169,8 +178,13 @@ def parse_xml_string(xml_string, expected_root_tag="patch", attempt_clean=True):
                 console.print(f"[dim]   {' ' * (col_num - 1)}^ Error near here[/dim]")
         else:
             console.print(
-                f"[dim]{xml_string[:1000]}...[/dim]"
+                f"[dim]{cleaned_xml_string[:1000]}...[/dim]"
             )  # Fallback if line number unknown
+
+        # Optionally show original uncleaned string if cleaning happened
+        if attempt_clean and xml_string != cleaned_xml_string:
+            console.print("[yellow]Original uncleaned string:[/yellow]")
+            console.print(f"[dim]{xml_string[:1000]}...[/dim]")
 
         return None
 
@@ -217,18 +231,30 @@ def get_next_patch_number(book_dir):
 
 # --- NovelWriter Class ---
 
-
 class NovelWriter:
-    # Modified __init__ to handle new folder naming scheme and file input for idea
+    # Modified __init__ to handle API/model selection, folder naming, file input for idea
     def __init__(
-        self, resume_folder_name=None, initial_prompt_file=None
-    ):  # Added initial_prompt_file parameter
+        self, api_type, model_name, openai_base_url=None, # Added openai_base_url
+        resume_folder_name=None, initial_prompt_file=None
+    ):
+        self.api_type = api_type.lower() # Store 'gemini' or 'openai'
+        self.model_name = model_name
+        self.openai_base_url = openai_base_url # Store OpenAI base URL
+
+        api_panel_title = "LLM Configuration"
+        api_panel_content = f"Using API: [bold cyan]{self.api_type}[/bold cyan] | Model: [bold cyan]{self.model_name}[/bold cyan]"
+        if self.api_type == 'openai' and self.openai_base_url:
+            api_panel_content += f"\nOpenAI Base URL: [bold cyan]{self.openai_base_url}[/bold cyan]"
+        console.print(Panel(api_panel_content, title=api_panel_title))
+
+
         self.api_key = self._get_api_key()
         if not self.api_key:
             console.print(
-                "[bold red]API Key is required to initialize the client. Exiting.[/bold red]"
+                f"[bold red]API Key for {self.api_type.upper()} is required. Exiting.[/bold red]"
             )
-            raise ValueError("Missing API Key")
+            raise ValueError(f"Missing {self.api_type.upper()} API Key")
+
         self.client = None
         self.book_root = None
         self.book_dir = None
@@ -238,8 +264,10 @@ class NovelWriter:
         self.chapters_generated_in_session = set()
         self.total_word_count = 0  # Initialize word count
 
-        self._init_client()  # Init client early
+        if not self._init_client(): # Init client early
+             raise RuntimeError(f"Failed to initialize {self.api_type.upper()} client.")
 
+        # --- Resume or Start New ---
         if resume_folder_name:
             # --- Resuming Book ---
             console.print(
@@ -313,6 +341,7 @@ class NovelWriter:
 
             # --- Generate initial title & Setup ---
             temp_uuid = str(uuid.uuid4())[:8]
+            # Use the selected LLM to generate the initial outline data
             initial_outline_data = self._generate_minimal_outline(idea)
 
             book_title = initial_outline_data.get(
@@ -355,18 +384,86 @@ class NovelWriter:
             )
             # Note: The full outline generation (characters, chapter summaries) happens in Step 1 of run()
 
-        # setup_logging() # Logging removed
+    def _get_api_key(self):
+        """Gets the appropriate API key (Gemini or OpenAI) from environment variables or prompts the user."""
+        load_dotenv()
+        key_name = f"{self.api_type.upper()}_API_KEY" # e.g., GEMINI_API_KEY or OPENAI_API_KEY
+        api_key = os.getenv(key_name)
+        if not api_key:
+            console.print(
+                f"[yellow]{key_name} not found in environment variables or .env file.[/yellow]"
+            )
+            try:
+                api_key = getpass.getpass(f"Enter your {self.api_type.upper()} API Key: ")
+            except (
+                EOFError
+            ):  # Handle environments where getpass isn't available (e.g., some CI/CD)
+                console.print(f"[red]Could not read {self.api_type.upper()} API key from input.[/red]")
+                return None
+        return api_key
+
+    def _init_client(self):
+        """Initializes the appropriate API client (Gemini or OpenAI)."""
+        if not self.api_key:
+            console.print(
+                f"[bold red]Cannot initialize {self.api_type.upper()} client without API Key.[/bold red]"
+            )
+            return False
+
+        try:
+            if self.api_type == 'gemini':
+                genai.configure(api_key=self.api_key)
+                # Defer setting generation config until the actual call for flexibility
+                self.client = genai.GenerativeModel(model_name=self.model_name)
+                # Simple test call (optional, consumes quota)
+                # self.client.count_tokens("test")
+                console.print(
+                    f"[green]Successfully initialized Google Gemini client with model '{self.model_name}'[/green]"
+                )
+                return True
+            elif self.api_type == 'openai':
+                 # Setup parameters for OpenAI client, including base_url if provided
+                openai_params = {
+                    "api_key": self.api_key
+                }
+                if self.openai_base_url:
+                    openai_params["base_url"] = self.openai_base_url
+                    console.print(f"[dim]Using custom OpenAI base URL: {self.openai_base_url}[/dim]")
+
+                self.client = openai.OpenAI(**openai_params)
+                # Simple test call (optional, consumes quota/checks connection)
+                # try:
+                #      self.client.models.list()
+                #      console.print("[green]Successfully tested connection to OpenAI endpoint.[/green]")
+                # except Exception as test_e:
+                #      console.print(f"[yellow]Warning: Could not verify connection to OpenAI endpoint: {test_e}[/yellow]")
+                #      # Continue anyway, might work for completions
+
+                console.print(
+                    f"[green]Successfully initialized OpenAI client with model '{self.model_name}'[/green]"
+                )
+                return True
+            else:
+                console.print(f"[bold red]Unsupported API type: {self.api_type}[/bold red]")
+                return False
+        except Exception as e:
+            console.print(
+                f"[bold red]Fatal Error: Could not initialize {self.api_type.upper()} client.[/bold red]"
+            )
+            console.print(f"Error details: {e}")
+            self.client = None
+            return False
 
     # New helper to get just title/synopsis without full structure generation yet
     def _generate_minimal_outline(self, idea):
-        """Attempts to generate just the title and synopsis using the LLM."""
-        console.print("[cyan]Generating initial title and synopsis...[/cyan]")
+        """Attempts to generate just the title and synopsis using the selected LLM."""
+        console.print(f"[cyan]Generating initial title and synopsis using {self.api_type}...[/cyan]")
         prompt = f"""
 Based on the following book idea/description, please generate ONLY a compelling title and a brief (1-2 sentence) synopsis.
 
 Idea/Description:
 ---
-{idea}
+{escape(idea)}
 ---
 
 Output format (Strictly JSON):
@@ -377,22 +474,38 @@ Output format (Strictly JSON):
 
 Do not include any other text, explanations, or markdown. Just the JSON object.
 """
-        # Use a simpler/faster model maybe? Or just the main one.
-        # For now, stick to the main model but with simpler request.
+        # Use the main LLM response function
         response_json_str = self._get_llm_response(
             prompt, "Generating Title/Synopsis", allow_stream=False
-        )  # Don't need streaming for JSON
+        ) # Don't need streaming for JSON
 
         if response_json_str:
             try:
-                # Clean potential markdown fences around JSON
+                # --- Refined Cleaning Logic ---
+                # 1. Strip leading/trailing whitespace from the raw response
+                stripped_response = response_json_str.strip()
+
+                # 2. Remove potential markdown fences (json optional)
                 cleaned_json_str = re.sub(
-                    r"^```json\s*",
+                    # Match ``` potentially followed by 'json' and optional whitespace/newline
+                    r"^```(json)?\s*",
                     "",
-                    response_json_str.strip(),
-                    flags=re.IGNORECASE | re.MULTILINE,
+                    stripped_response,
+                    flags=re.IGNORECASE | re.MULTILINE
                 )
-                cleaned_json_str = re.sub(r"\s*```$", "", cleaned_json_str)
+                # Match optional whitespace/newline followed by ``` at the end
+                cleaned_json_str = re.sub(
+                    r"\s*```$",
+                    "",
+                    cleaned_json_str
+                )
+
+                # 3. Strip again after fence removal, just in case
+                cleaned_json_str = cleaned_json_str.strip()
+                # --- End Refined Cleaning Logic ---
+
+
+                # 4. Parse the cleaned string
                 data = json.loads(cleaned_json_str)
                 if isinstance(data, dict) and "title" in data and "synopsis" in data:
                     console.print("[green]✓ Title and Synopsis generated.[/green]")
@@ -402,13 +515,19 @@ Do not include any other text, explanations, or markdown. Just the JSON object.
                     }
                 else:
                     console.print(
-                        "[yellow]Warning: LLM response was not valid JSON with title/synopsis keys.[/yellow]"
+                        f"[yellow]Warning: {self.api_type.upper()} response was not valid JSON with title/synopsis keys after cleaning.[/yellow]"
                     )
+                    console.print(f"[dim]Cleaned String Attempted: {cleaned_json_str[:500]}[/dim]")
+                    console.print(f"[dim]Original Response: {response_json_str[:500]}[/dim]")
+
+
             except json.JSONDecodeError as e:
                 console.print(
-                    f"[yellow]Warning: Failed to decode LLM response as JSON: {e}[/yellow]"
+                    f"[yellow]Warning: Failed to decode {self.api_type.upper()} response as JSON: {e}[/yellow]"
                 )
-                console.print(f"[dim]Received: {response_json_str[:200]}[/dim]")
+                # Show both the original and what was attempted to parse
+                console.print(f"[dim]Cleaned String Attempted: {cleaned_json_str[:500]}[/dim]")
+                console.print(f"[dim]Original Response: {response_json_str[:500]}[/dim]")
             except Exception as e:
                 console.print(
                     f"[yellow]Warning: Error processing title/synopsis response: {e}[/yellow]"
@@ -421,53 +540,6 @@ Do not include any other text, explanations, or markdown. Just the JSON object.
             "title": f"Untitled Novel ({str(uuid.uuid4())[:4]})",
             "synopsis": "Synopsis pending.",
         }
-
-    def _get_api_key(self):
-        """Gets Gemini API key from environment variables or prompts the user."""
-        load_dotenv()
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            console.print(
-                "[yellow]GEMINI_API_KEY not found in environment variables or .env file.[/yellow]"
-            )
-            try:
-                api_key = getpass.getpass("Enter your Gemini API Key: ")
-            except (
-                EOFError
-            ):  # Handle environments where getpass isn't available (e.g., some CI/CD)
-                console.print("[red]Could not read API key from input.[/red]")
-                return None
-        return api_key
-
-    def _init_client(self):
-        """Initializes the Gemini client."""
-        if not self.api_key:
-            # Should have been caught in __init__, but double-check
-            console.print(
-                "[bold red]Cannot initialize Gemini client without API Key.[/bold red]"
-            )
-            return False  # Indicate failure
-
-        try:
-            genai.configure(api_key=self.api_key)
-            self.client = genai.GenerativeModel(
-                model_name=WRITING_MODEL_NAME,
-                generation_config=WRITING_MODEL_CONFIG,
-            )
-            # Simple test call (optional, might consume quota)
-            # self.client.count_tokens("test")
-            console.print(
-                f"[green]Successfully initialized Gemini client with model '{WRITING_MODEL_NAME}'[/green]"
-            )
-            return True
-        except Exception as e:
-            console.print(
-                "[bold red]Fatal Error: Could not initialize Gemini client.[/bold red]"
-            )
-            console.print(f"Error details: {e}")
-            # console.print_exception(show_locals=False) # Show traceback if needed
-            self.client = None  # Ensure client is None on failure
-            return False
 
     def _load_book_state(self):
         """Loads the latest book state from XML files in the book directory."""
@@ -610,311 +682,423 @@ Do not include any other text, explanations, or markdown. Just the JSON object.
             )
             return False  # Indicate failure
 
-    # --- Feature: Enhanced Error Handling & Retry ---
+    # --- API Abstraction Layer ---
+
+    def _call_gemini_api(self, prompt_content, task_description, allow_stream):
+        """Handles the specific logic for calling the Google Gemini API."""
+        full_response = ""
+        api_name = "Gemini"
+
+        # Construct Gemini-specific generation config
+        generation_config = gemini_types.GenerationConfig(
+            temperature=DEFAULT_TEMPERATURE,
+            max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS, # Use the updated default
+            top_p=DEFAULT_TOP_P,
+            top_k=DEFAULT_TOP_K,
+        )
+
+        if allow_stream:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=True,
+            ) as progress:
+                task = progress.add_task(description=f"[cyan]{api_name} is thinking...", total=None)
+                response_stream = self.client.generate_content(
+                    contents=prompt_content,
+                    stream=True,
+                    generation_config=generation_config
+                )
+                console.print(f"[cyan]>>> {api_name} Response ({task_description}):[/cyan]")
+                first_chunk = True
+                try:
+                    for chunk in response_stream:
+                        if first_chunk:
+                            progress.update(task, description="[cyan]Receiving response...")
+                            first_chunk = False
+
+                        # Check for blocking reasons (more robust check)
+                        block_reason = getattr(getattr(chunk, 'prompt_feedback', None), 'block_reason', None)
+                        if block_reason:
+                            ratings = getattr(chunk.prompt_feedback, 'safety_ratings', [])
+                            ratings_str = "\n".join([f"  - {r.category.name}: {r.probability.name}" for r in ratings])
+                            msg = f"Content generation blocked during streaming.\nReason: {block_reason.name}\nSafety Ratings:\n{ratings_str or 'N/A'}"
+                            console.print(f"\n[bold red]API Safety Error ({api_name}): {msg}[/bold red]")
+                            raise gemini_types.BlockedPromptException(msg)
+
+                        # Append text safely
+                        try:
+                            chunk_text = chunk.text
+                            print(chunk_text, end="", flush=True)
+                            full_response += chunk_text
+                        except ValueError: # Sometimes mid-stream errors occur
+                             # Check finish_reason if available on the chunk (less common)
+                            finish_reason = getattr(getattr(chunk, 'candidates', [None])[0], 'finish_reason', None)
+                            if finish_reason and finish_reason.name == 'SAFETY':
+                                msg = "Content generation stopped mid-stream due to safety."
+                                console.print(f"\n[bold red]API Safety Error ({api_name}): {msg}[/bold red]")
+                                raise gemini_types.BlockedPromptException(msg)
+                            else:
+                                console.print(f"\n[yellow]Warning: Received potentially invalid chunk data from {api_name}.[/yellow]")
+                        except AttributeError: # Handle cases where chunk might not have .text
+                             # Check parts if available
+                            try:
+                                for part in chunk.parts:
+                                    if hasattr(part, "text"):
+                                        chunk_text = part.text
+                                        print(chunk_text, end="", flush=True)
+                                        full_response += chunk_text
+                            except (AttributeError, ValueError):
+                                console.print(f"\n[yellow]Warning: Could not extract text from chunk part in {api_name} stream.[/yellow]")
+
+
+                finally:
+                    print() # Newline after streaming finishes or errors
+
+                # Final check after stream (important)
+                final_block_reason = getattr(getattr(response_stream, 'prompt_feedback', None), 'block_reason', None)
+                if final_block_reason:
+                    ratings = getattr(response_stream.prompt_feedback, 'safety_ratings', [])
+                    ratings_str = "\n".join([f"  - {r.category.name}: {r.probability.name}" for r in ratings])
+                    msg = f"Content generation blocked (final check).\nReason: {final_block_reason.name}\nSafety Ratings:\n{ratings_str or 'N/A'}"
+                    console.print(f"\n[bold red]API Safety Error ({api_name}): {msg}[/bold red]")
+                    raise gemini_types.BlockedPromptException(msg)
+                # Check candidate finish reason if no block reason
+                elif not final_block_reason:
+                     final_candidate = getattr(response_stream, 'candidates', [None])[0]
+                     if final_candidate:
+                         final_finish_reason = getattr(final_candidate, 'finish_reason', None)
+                         if final_finish_reason:
+                            if final_finish_reason.name == 'SAFETY':
+                                 msg = "Content generation likely blocked due to safety (Final Finish Reason: SAFETY)."
+                                 console.print(f"\n[bold red]API Safety Error ({api_name}): {msg}[/bold red]")
+                                 raise gemini_types.BlockedPromptException(msg)
+                            elif final_finish_reason.name == 'MAX_TOKENS':
+                                 console.print(f"\n[yellow]Warning ({api_name}): Generation stopped because maximum token limit ({DEFAULT_MAX_OUTPUT_TOKENS}) was reached.[/yellow]")
+
+
+        else: # Non-streaming Gemini
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=True,
+            ) as progress:
+                progress.add_task(description=f"[cyan]{api_name} is thinking...", total=None)
+                response = self.client.generate_content(
+                    contents=prompt_content,
+                    generation_config=generation_config
+                )
+
+            # Check for blocking
+            block_reason = getattr(getattr(response, 'prompt_feedback', None), 'block_reason', None)
+            if block_reason:
+                ratings = getattr(response.prompt_feedback, 'safety_ratings', [])
+                ratings_str = "\n".join([f"  - {r.category.name}: {r.probability.name}" for r in ratings])
+                msg = f"Content generation blocked.\nReason: {block_reason.name}\nSafety Ratings:\n{ratings_str or 'N/A'}"
+                console.print(f"[bold red]API Safety Error ({api_name}): {msg}[/bold red]")
+                raise gemini_types.BlockedPromptException(msg)
+
+            # Extract text safely
+            try:
+                full_response = response.text
+            except ValueError as ve: # Often indicates blocked content without explicit reason
+                 # Check candidate finish reason
+                 final_candidate = getattr(response, 'candidates', [None])[0]
+                 if final_candidate:
+                    finish_reason = getattr(final_candidate, 'finish_reason', None)
+                    if finish_reason:
+                        if finish_reason.name == 'SAFETY':
+                             msg = f"Content generation likely blocked due to safety (Finish Reason: SAFETY). Error: {ve}"
+                             console.print(f"[bold red]API Safety Error ({api_name}): {msg}[/bold red]")
+                             raise gemini_types.BlockedPromptException(msg) from ve
+                        elif finish_reason.name == 'MAX_TOKENS':
+                             console.print(f"\n[yellow]Warning ({api_name}): Generation stopped because maximum token limit ({DEFAULT_MAX_OUTPUT_TOKENS}) was reached.[/yellow]")
+                             # Try to extract partial text anyway if possible
+                             try:
+                                  full_response = "".join(part.text for part in response.parts if hasattr(part, 'text'))
+                                  if not full_response: raise AttributeError("No text found even after MAX_TOKENS")
+                             except Exception:
+                                   console.print(f"[bold red]Error extracting text from {api_name} response after MAX_TOKENS finish: {ve}[/bold red]")
+                                   raise ValueError(f"Could not extract text from {api_name} response after MAX_TOKENS finish: {ve}") from ve
+
+                        else:
+                            # Re-raise original error if not safety/max_tokens related
+                            console.print(f"[bold red]Error extracting text from {api_name} response: {ve}[/bold red]")
+                            console.print(f"[dim]Response object (summary): {response}[/dim]")
+                            raise ValueError(f"Could not extract text from {api_name} response: {ve}") from ve
+                    else: # No finish reason, raise original error
+                        console.print(f"[bold red]Error extracting text from {api_name} response: {ve}[/bold red]")
+                        raise ValueError(f"Could not extract text from {api_name} response: {ve}") from ve
+                 else: # No candidate, raise original error
+                     console.print(f"[bold red]Error extracting text from {api_name} response: {ve}[/bold red]")
+                     raise ValueError(f"Could not extract text from {api_name} response: {ve}") from ve
+
+            except AttributeError: # Handle cases where .text might be missing, check parts
+                 try:
+                     full_response = "".join(part.text for part in response.parts if hasattr(part, 'text'))
+                     if not full_response: # If parts exist but are empty
+                         final_candidate = getattr(response, 'candidates', [None])[0]
+                         finish_reason_name = 'Unknown'
+                         if final_candidate and hasattr(final_candidate, 'finish_reason'):
+                              finish_reason_name = final_candidate.finish_reason.name
+                         raise ValueError(f"Response object has no 'text' and empty 'parts'. Finish Reason: {finish_reason_name}")
+                 except (AttributeError, ValueError) as e:
+                     console.print(f"[bold red]Error extracting text from {api_name} response parts: {e}[/bold red]")
+                     console.print(f"[dim]Response object (summary): {response}[/dim]")
+                     raise ValueError(f"Could not extract text from {api_name} response: {e}") from e
+
+
+            console.print(f"[cyan]>>> {api_name} Response ({task_description}):[/cyan]")
+            console.print(f"[dim]{full_response[:1000]}{'...' if len(full_response) > 1000 else ''}[/dim]")
+
+        return full_response
+
+    def _call_openai_api(self, prompt_content, task_description, allow_stream):
+        """Handles the specific logic for calling the OpenAI API."""
+        full_response = ""
+        api_name = "OpenAI"
+
+        messages = [{"role": "user", "content": prompt_content}]
+
+        # Prepare common parameters
+        params = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": DEFAULT_TEMPERATURE,
+            "max_tokens": DEFAULT_MAX_OUTPUT_TOKENS, # Use the updated default
+            "top_p": DEFAULT_TOP_P,
+            "stream": allow_stream,
+        }
+
+        if allow_stream:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=True,
+            ) as progress:
+                task = progress.add_task(description=f"[cyan]{api_name} is thinking...", total=None)
+                response_stream = self.client.chat.completions.create(**params)
+                console.print(f"[cyan]>>> {api_name} Response ({task_description}):[/cyan]")
+                first_chunk = True
+                finish_reason = None
+                try:
+                    for chunk in response_stream:
+                        if first_chunk:
+                            progress.update(task, description="[cyan]Receiving response...")
+                            first_chunk = False
+
+                        # Check for content and finish reason in each chunk
+                        choice = chunk.choices[0] if chunk.choices else None
+                        if choice:
+                            content = choice.delta.content
+                            if content:
+                                print(content, end="", flush=True)
+                                full_response += content
+
+                            # Store finish reason if present
+                            if choice.finish_reason:
+                                finish_reason = choice.finish_reason
+                                break # Stop processing chunks once finished
+
+                finally:
+                     print() # Newline
+
+                # Check finish reason after stream
+                if finish_reason == 'content_filter':
+                    msg = "Content generation stopped by OpenAI's content filter."
+                    console.print(f"\n[bold red]API Safety Error ({api_name}): {msg}[/bold red]")
+                    raise openai.BadRequestError(msg, body={"message": msg, "type": "content_filter"}) # Simulate error structure
+                elif finish_reason == 'length':
+                     console.print(f"\n[yellow]Warning ({api_name}): Generation stopped because maximum token limit ({DEFAULT_MAX_OUTPUT_TOKENS}) was reached.[/yellow]")
+                # Handle other finish reasons if necessary
+
+        else: # Non-streaming OpenAI
+             with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=True,
+            ) as progress:
+                progress.add_task(description=f"[cyan]{api_name} is thinking...", total=None)
+                response = self.client.chat.completions.create(**params)
+
+             # Check finish reason
+             finish_reason = response.choices[0].finish_reason if response.choices else None
+             if finish_reason == 'content_filter':
+                 msg = "Content generation blocked by OpenAI's content filter."
+                 console.print(f"[bold red]API Safety Error ({api_name}): {msg}[/bold red]")
+                 # Include response details if helpful
+                 error_body = response.model_dump() if hasattr(response, 'model_dump') else {'message': msg}
+                 raise openai.BadRequestError(msg, body=error_body)
+             elif finish_reason == 'length':
+                  console.print(f"\n[yellow]Warning ({api_name}): Generation stopped because maximum token limit ({DEFAULT_MAX_OUTPUT_TOKENS}) was reached.[/yellow]")
+             # Check other finish reasons if needed
+
+             # Extract text
+             if response.choices and response.choices[0].message:
+                 full_response = response.choices[0].message.content or ""
+             else:
+                 # This case should be rare if no error was raised
+                 console.print(f"[bold red]Error ({api_name}): No response content found.[/bold red]")
+                 console.print(f"[dim]Response object (summary): {response}[/dim]")
+                 raise ValueError(f"Could not extract text from {api_name} response.")
+
+             console.print(f"[cyan]>>> {api_name} Response ({task_description}):[/cyan]")
+             console.print(f"[dim]{full_response[:1000]}{'...' if len(full_response) > 1000 else ''}[/dim]")
+
+        return full_response
+
+    # --- Enhanced Error Handling & Retry ---
     def _get_llm_response(
         self, prompt_content, task_description="Generating content", allow_stream=True
     ):
         """
-        Sends prompt to LLM, handles streaming/non-streaming, logs interaction (removed),
-        and handles API errors with retries and backoff.
+        Sends prompt to the selected LLM (Gemini or OpenAI), handles streaming/non-streaming,
+        and manages API errors with retries and backoff.
         """
         if self.client is None:
             console.print(
-                "[bold red]Error: Gemini client not initialized. Cannot make API call.[/bold red]"
+                f"[bold red]Error: {self.api_type.upper()} client not initialized. Cannot make API call.[/bold red]"
             )
             return None
 
         retries = 0
+        last_error = None # Store last error for final message
+
         while retries < MAX_API_RETRIES:
             full_response = ""
+            api_name_upper = self.api_type.upper()
             try:
                 console.print(
                     Panel(
-                        f"[yellow]Sending request to Gemini ({task_description})... (Attempt {retries + 1}/{MAX_API_RETRIES})[/yellow]",
+                        f"[yellow]Sending request to {api_name_upper} ({task_description})... (Attempt {retries + 1}/{MAX_API_RETRIES})[/yellow]",
                         border_style="dim",
                     )
                 )
 
-                if allow_stream:
-                    # --- Streaming ---
-                    with Progress(
-                        SpinnerColumn(),
-                        TextColumn("[progress.description]{task.description}"),
-                        transient=True,  # Keeps spinner clean
-                    ) as progress:
-                        task = progress.add_task(
-                            description="[cyan]Gemini is thinking...", total=None
-                        )
-                        response_stream = self.client.generate_content(
-                            contents=prompt_content, stream=True
-                        )
-
-                        console.print(
-                            f"[cyan]>>> Gemini Response ({task_description}):[/cyan]"
-                        )
-                        first_chunk = True
-                        response_completed_normally = (
-                            False  # Track if stream finished ok
-                        )
-                        for chunk in response_stream:
-                            if first_chunk:
-                                progress.update(
-                                    task, description="[cyan]Receiving response..."
-                                )
-                                first_chunk = False
-
-                            # Check for blocking reasons in each chunk's feedback
-                            if (
-                                hasattr(
-                                    chunk, "prompt_feedback"
-                                )  # Check if attribute exists
-                                and chunk.prompt_feedback
-                                and chunk.prompt_feedback.block_reason
-                            ):
-                                reason = chunk.prompt_feedback.block_reason
-                                ratings = (
-                                    chunk.prompt_feedback.safety_ratings
-                                    if chunk.prompt_feedback
-                                    else []
-                                )
-                                ratings_str = "\n".join(
-                                    [
-                                        f"  - {r.category.name}: {r.probability.name}"
-                                        for r in ratings
-                                    ]
-                                )
-                                msg = f"Content generation blocked during streaming.\nReason: {reason.name if reason else 'Unknown'}\nSafety Ratings:\n{ratings_str or 'N/A'}"
-                                console.print(
-                                    f"\n[bold red]API Safety Error: {msg}[/bold red]"
-                                )
-                                # This is likely unrecoverable by simple retry, treat as fatal for this attempt
-                                raise types.BlockedPromptException(
-                                    msg
-                                )  # Re-raise for outer catch
-
-                            # Append text safely
-                            try:
-                                # Check if chunk has 'text' attribute before accessing
-                                if hasattr(chunk, "text"):
-                                    chunk_text = chunk.text
-                                    print(chunk_text, end="", flush=True)
-                                    full_response += chunk_text
-                                elif hasattr(
-                                    chunk, "parts"
-                                ):  # Handle potential 'parts' structure
-                                    for part in chunk.parts:
-                                        if hasattr(part, "text"):
-                                            chunk_text = part.text
-                                            print(chunk_text, end="", flush=True)
-                                            full_response += chunk_text
-                                # else: Unknown chunk structure, skip
-
-                            except ValueError as ve:
-                                # This might happen if the stream is abruptly terminated or blocked without explicit reason yet
-                                console.print(
-                                    f"\n[yellow]Warning: Received potentially invalid chunk data: {ve}[/yellow]"
-                                )
-                                # Check overall response feedback *after* the loop if needed, but blocking check above is better
-                                continue  # Try to get next chunk
-
-                        print()  # Newline after streaming finishes
-                        response_completed_normally = True  # Mark as finished ok
-
-                        # Check final response feedback after stream completion (important!)
-                        # Accessing internal _response might be fragile, prefer official ways if available
-                        final_feedback = None
-                        if hasattr(
-                            response_stream, "prompt_feedback"
-                        ):  # Check the stream object itself first
-                            final_feedback = response_stream.prompt_feedback
-                        elif hasattr(response_stream, "_response") and hasattr(
-                            response_stream._response, "prompt_feedback"
-                        ):  # Fallback
-                            final_feedback = response_stream._response.prompt_feedback
-
-                        if final_feedback and final_feedback.block_reason:
-                            reason = final_feedback.block_reason
-                            ratings = final_feedback.safety_ratings
-                            ratings_str = "\n".join(
-                                [
-                                    f"  - {r.category.name}: {r.probability.name}"
-                                    for r in ratings
-                                ]
-                            )
-                            msg = f"Content generation blocked (final check).\nReason: {reason.name if reason else 'Unknown'}\nSafety Ratings:\n{ratings_str or 'N/A'}"
-                            console.print(
-                                f"\n[bold red]API Safety Error: {msg}[/bold red]"
-                            )
-                            raise types.BlockedPromptException(msg)
-
+                # Call the appropriate API-specific function
+                if self.api_type == 'gemini':
+                    full_response = self._call_gemini_api(prompt_content, task_description, allow_stream)
+                elif self.api_type == 'openai':
+                    full_response = self._call_openai_api(prompt_content, task_description, allow_stream)
                 else:
-                    # --- Non-Streaming ---
-                    with Progress(
-                        SpinnerColumn(),
-                        TextColumn("[progress.description]{task.description}"),
-                        transient=True,
-                    ) as progress:
-                        progress.add_task(
-                            description="[cyan]Gemini is thinking...", total=None
-                        )
-                        response = self.client.generate_content(
-                            contents=prompt_content
-                        )  # Non-streaming call
-
-                    # Check for blocking (more straightforward in non-streaming)
-                    if (
-                        hasattr(response, "prompt_feedback")  # Check attribute exists
-                        and response.prompt_feedback
-                        and response.prompt_feedback.block_reason
-                    ):
-                        reason = response.prompt_feedback.block_reason
-                        ratings = (
-                            response.prompt_feedback.safety_ratings
-                            if response.prompt_feedback
-                            else []
-                        )
-                        ratings_str = "\n".join(
-                            [
-                                f"  - {r.category.name}: {r.probability.name}"
-                                for r in ratings
-                            ]
-                        )
-                        msg = f"Content generation blocked.\nReason: {reason.name if reason else 'Unknown'}\nSafety Ratings:\n{ratings_str or 'N/A'}"
-                        console.print(f"[bold red]API Safety Error: {msg}[/bold red]")
-                        raise types.BlockedPromptException(msg)  # Raise for outer catch
-
-                    # Extract text safely
-                    try:
-                        # Check if response has 'text' attribute
-                        if hasattr(response, "text"):
-                            full_response = response.text
-                        elif hasattr(
-                            response, "parts"
-                        ):  # Handle 'parts' structure if text is missing
-                            full_response = "".join(
-                                part.text
-                                for part in response.parts
-                                if hasattr(part, "text")
-                            )
-                        else:
-                            # If neither text nor parts, check candidates for finish reason
-                            finish_reason_msg = "Unknown reason"
-                            if hasattr(response, "candidates") and response.candidates:
-                                candidate = response.candidates[0]
-                                if hasattr(candidate, "finish_reason"):
-                                    finish_reason_msg = candidate.finish_reason.name
-                                # Check safety ratings on the candidate if available
-                                if (
-                                    hasattr(candidate, "safety_ratings")
-                                    and candidate.safety_ratings
-                                ):
-                                    ratings = candidate.safety_ratings
-                                    ratings_str = "\n".join(
-                                        [
-                                            f"  - {r.category.name}: {r.probability.name}"
-                                            for r in ratings
-                                        ]
-                                    )
-                                    finish_reason_msg += (
-                                        f"\nSafety Ratings:\n{ratings_str or 'N/A'}"
-                                    )
-
-                            if finish_reason_msg == "SAFETY":
-                                raise types.BlockedPromptException(
-                                    "Content generation likely blocked due to safety (Finish Reason: SAFETY)."
-                                )
-                            else:
-                                raise ValueError(
-                                    f"Response object does not contain expected 'text' or 'parts' attribute. Finish Reason: {finish_reason_msg}"
-                                )
-
-                        console.print(
-                            f"[cyan]>>> Gemini Response ({task_description}):[/cyan]"
-                        )
-                        console.print(
-                            f"[dim]{full_response[:1000]}{'...' if len(full_response) > 1000 else ''}[/dim]"
-                        )
-                    except ValueError as ve:
-                        # Handle case where response might be blocked but didn't have block_reason set explicitly?
-                        # Or other extraction issues
-                        console.print(
-                            f"[bold red]Error retrieving text from non-streaming response: {ve}[/bold red]"
-                        )
-                        console.print(
-                            f"[dim]Response object (summary): {response}[/dim]"
-                        )
-
-                        # Re-raise or handle as appropriate for retry logic
-                        raise ValueError(
-                            f"Could not extract text from response: {ve}"
-                        ) from ve
+                    # Should have been caught during init, but safety check
+                    console.print(f"[bold red]Internal Error: Unsupported API type '{self.api_type}' in _get_llm_response.[/bold red]")
+                    return None
 
                 # --- Success Case ---
+                # Check if the response is effectively empty (might happen even without errors)
+                if not full_response or not full_response.strip():
+                     console.print(f"[yellow]Warning: Received an empty response from {api_name_upper}.[/yellow]")
+                     # Consider if this should trigger a retry or just return None/empty
+                     # For now, treat it as success but log warning. User can retry via editing if needed.
+
+
                 console.print(
                     Panel(
-                        "[green]✓ Gemini response received successfully.[/green]",
+                        f"[green]✓ {api_name_upper} response received successfully.[/green]",
                         border_style="dim",
                     )
                 )
-                return full_response  # Successful, exit the retry loop
+                return full_response.strip()  # Successful, exit the retry loop
 
             # --- Exception Handling & Retry Logic ---
-            except (
-                types.BlockedPromptException,
-                # types.StopCandidateException, # This might indicate normal stop, not necessarily an error
-            ) as safety_error:
-                # Safety errors are usually not recoverable by retrying the same prompt
-                console.print(f"[bold red]Safety Error: {safety_error}[/bold red]")
-                console.print(
-                    "[yellow]This type of error usually requires changing the prompt or safety settings. Retrying might not help.[/yellow]"
-                )
-                # Ask if user wants to retry anyway? Or just abort? For now, abort this attempt.
-                if not Confirm.ask(
-                    f"[yellow]Safety error encountered. Try sending the request again anyway? (Attempt {retries + 1}/{MAX_API_RETRIES})[/yellow]",
-                    default=False,
-                ):
-                    console.print(
-                        "[red]Aborting API call due to safety error and user choice.[/red]"
-                    )
+
+            # Gemini Specific Errors
+            except gemini_types.BlockedPromptException as safety_error:
+                error_msg = f"Safety Error ({api_name_upper}): {safety_error}"
+                last_error = error_msg
+                # Message already printed in _call_gemini_api
+                console.print("[yellow]Safety errors often require prompt changes. Retrying may not help.[/yellow]")
+                if not Confirm.ask(f"Try sending the request again anyway? (Attempt {retries + 1}/{MAX_API_RETRIES})", default=False):
                     return None
-                # If they choose to retry, increment count and continue loop (backoff happens below)
 
             except google_api_exceptions.ResourceExhausted as rate_limit_error:
-                error_msg = f"API Rate Limit Error: {rate_limit_error}"
+                error_msg = f"API Rate Limit Error ({api_name_upper}): {rate_limit_error}"
+                last_error = error_msg
                 console.print(f"[bold red]{error_msg}[/bold red]")
-                # Retry makes sense here
+                # Retry makes sense
 
             except google_api_exceptions.DeadlineExceeded as timeout_error:
-                error_msg = f"API Timeout Error: {timeout_error}"
+                error_msg = f"API Timeout Error ({api_name_upper}): {timeout_error}"
+                last_error = error_msg
                 console.print(f"[bold red]{error_msg}[/bold red]")
                 # Retry might help
 
             except google_api_exceptions.GoogleAPICallError as api_error:
-                error_msg = f"API Call Error: {type(api_error).__name__} - {api_error}"
+                error_msg = f"Gemini API Call Error: {type(api_error).__name__} - {api_error}"
+                last_error = error_msg
                 console.print(f"[bold red]{error_msg}[/bold red]")
-                # Retry might help for transient issues (e.g., 503 Service Unavailable)
+                # Retry might help for transient issues
 
-            except ET.ParseError as xml_error:
-                # This happens *after* getting a response, but indicates a bad response likely due to API issues
-                error_msg = f"XML Parsing Error after receiving response: {xml_error}"
+            # OpenAI Specific Errors
+            except openai.RateLimitError as rate_limit_error:
+                error_msg = f"API Rate Limit Error ({api_name_upper}): {rate_limit_error}"
+                last_error = error_msg
                 console.print(f"[bold red]{error_msg}[/bold red]")
-                console.print(
-                    "[yellow]This often means the API response was incomplete or malformed (possibly due to interruption, blocking, or rate limits).[/yellow]"
-                )
-                console.print(
-                    f"[dim]Partial response received before error:\n{full_response[:500]}...[/dim]"
-                )
+                # Retry makes sense
+
+            except openai.APITimeoutError as timeout_error:
+                 error_msg = f"API Timeout Error ({api_name_upper}): {timeout_error}"
+                 last_error = error_msg
+                 console.print(f"[bold red]{error_msg}[/bold red]")
+                 # Retry might help
+
+            except openai.APIConnectionError as conn_error:
+                 error_msg = f"API Connection Error ({api_name_upper}): {conn_error}"
+                 last_error = error_msg
+                 console.print(f"[bold red]{error_msg}[/bold red]")
+                 # Retry might help (especially with local endpoints)
+
+            except openai.AuthenticationError as auth_error:
+                 error_msg = f"API Authentication Error ({api_name_upper}): {auth_error}"
+                 last_error = error_msg
+                 console.print(f"[bold red]{error_msg}[/bold red]")
+                 # Retrying won't help - likely bad key
+                 console.print("[red]Please check your API key. Aborting call.[/red]")
+                 return None # Don't retry auth errors
+
+            except openai.BadRequestError as bad_request_error:
+                # Often includes content filter errors, check message
+                error_msg = f"API Bad Request Error ({api_name_upper}): {bad_request_error}"
+                last_error = error_msg
+                # Message already printed in _call_openai_api if content_filter
+                if "content_filter" in str(bad_request_error).lower():
+                     console.print("[yellow]This was likely due to the content safety filter. Retrying may not help.[/yellow]")
+                     if not Confirm.ask(f"Try sending the request again anyway? (Attempt {retries + 1}/{MAX_API_RETRIES})", default=False):
+                         return None
+                else:
+                     # Other bad requests (e.g., invalid model, malformed input) likely won't be fixed by retry
+                     console.print("[red]This error suggests an issue with the request itself (e.g. invalid model, context too long). Aborting call.[/red]")
+                     # Optionally print more details if available
+                     if hasattr(bad_request_error, 'body') and bad_request_error.body:
+                          console.print(f"[dim]Error Body: {bad_request_error.body}[/dim]")
+                     return None
+
+            except openai.APIError as api_error: # General OpenAI API errors
+                error_msg = f"OpenAI API Error: {type(api_error).__name__} - {api_error}"
+                last_error = error_msg
+                console.print(f"[bold red]{error_msg}[/bold red]")
+                # Retry might help for transient server issues (e.g., 5xx)
+
+            # General Errors (potentially affecting both)
+            except ET.ParseError as xml_error:
+                # This happens *after* getting a response, indicates bad response format
+                error_msg = f"XML Parsing Error after receiving response: {xml_error}"
+                last_error = error_msg
+                console.print(f"[bold red]{error_msg}[/bold red]")
+                console.print(f"[yellow]This often means the {api_name_upper} response was incomplete or malformed.[/yellow]")
+                console.print(f"[dim]Partial response received before error:\n{full_response[:500]}...[/dim]")
                 # Retry might get a complete response
 
             except ValueError as val_error:  # Catch extraction errors raised above
-                error_msg = f"Data Extraction Error: {val_error}"
+                error_msg = f"Data Extraction/Validation Error: {val_error}"
+                last_error = error_msg
                 console.print(f"[bold red]{error_msg}[/bold red]")
-                # Retry might help if it was transient
+                # Retry might help if it was transient (e.g., empty response)
 
             except Exception as e:
-                error_msg = (
-                    f"Unexpected Error during API call: {type(e).__name__} - {e}"
-                )
+                error_msg = f"Unexpected Error during API call: {type(e).__name__} - {e}"
+                last_error = error_msg
                 console.print(f"[bold red]{error_msg}[/bold red]")
                 console.print_exception(show_locals=False, word_wrap=True)
                 # Retry might help for some transient errors
@@ -922,27 +1106,18 @@ Do not include any other text, explanations, or markdown. Just the JSON object.
             # --- Retry Action ---
             retries += 1
             if retries < MAX_API_RETRIES:
-                wait_time = API_RETRY_BACKOFF_FACTOR * (
-                    2 ** (retries - 1)
-                )  # Exponential backoff
-                console.print(
-                    f"[yellow]Waiting {wait_time:.1f} seconds before retrying...[/yellow]"
-                )
+                wait_time = API_RETRY_BACKOFF_FACTOR * (2 ** (retries - 1)) # Exponential backoff
+                console.print(f"[yellow]Waiting {wait_time:.1f} seconds before retrying...[/yellow]")
                 time.sleep(wait_time)
                 # Ask user if they want to proceed with the retry
-                if not Confirm.ask(
-                    f"[yellow]Error encountered. Proceed with retry attempt {retries + 1}/{MAX_API_RETRIES}? [/yellow]",
-                    default=True,
-                ):
-                    console.print(
-                        "[red]Aborting API call after error due to user choice.[/red]"
-                    )
+                if not Confirm.ask(f"Error encountered. Proceed with retry attempt {retries + 1}/{MAX_API_RETRIES}?", default=True):
+                    console.print(f"[red]Aborting API call after error due to user choice.[/red]")
                     return None  # User cancelled retry
                 # Continue loop
             else:
-                console.print(
-                    f"[bold red]Maximum retries ({MAX_API_RETRIES}) reached. Failed to get a valid response.[/bold red]"
-                )
+                console.print(f"[bold red]Maximum retries ({MAX_API_RETRIES}) reached. Failed to get a valid response from {api_name_upper}.[/bold red]")
+                if last_error:
+                     console.print(f"[bold red]Last error: {last_error}[/bold red]")
                 return None  # Max retries exceeded
 
         # Should not be reached if logic is correct, but as a fallback:
@@ -1192,8 +1367,22 @@ Do not include any other text, explanations, or markdown. Just the JSON object.
         chapter_word_counts = {}
         if chapters:
             # Sort chapters by ID numerically before processing counts
-            sorted_chapters_for_wc = sorted(chapters, key=lambda c: int(c.get("id", 0)))
-            for chap in sorted_chapters_for_wc:
+            sorted_chapters_for_wc = []
+            invalid_id_chapters = []
+            for c in chapters:
+                try:
+                    # Try converting ID to int for sorting
+                    int(c.get("id", "NaN"))
+                    sorted_chapters_for_wc.append(c)
+                except ValueError:
+                    invalid_id_chapters.append(c) # Collect chapters with non-integer IDs
+
+            # Sort the ones with valid integer IDs
+            sorted_chapters_for_wc.sort(key=lambda c: int(c.get("id")))
+            # Append the invalid ID chapters at the end (or handle differently if needed)
+            all_sorted_chapters = sorted_chapters_for_wc + invalid_id_chapters
+
+            for chap in all_sorted_chapters:
                 chap_id = chap.get("id")
                 content = chap.find("content")
                 chap_wc = 0
@@ -1201,8 +1390,14 @@ Do not include any other text, explanations, or markdown. Just the JSON object.
                     paragraphs = content.findall(".//paragraph")
                     for para in paragraphs:
                         chap_wc += _count_words(para.text)
-                chapter_word_counts[chap_id] = chap_wc
-                total_wc += chap_wc
+                if chap_id: # Only count if ID exists
+                    chapter_word_counts[chap_id] = chap_wc
+                    total_wc += chap_wc
+                else: # Chapter missing ID
+                     # Count towards total but don't store by ID
+                     total_wc += chap_wc
+
+
         self.total_word_count = total_wc  # Store total word count
 
         # --- Display ---
@@ -1228,7 +1423,9 @@ Do not include any other text, explanations, or markdown. Just the JSON object.
             char_table.add_column("ID", style="dim")
             char_table.add_column("Name")
             char_table.add_column("Description")
-            for char in characters:
+            # Sort characters by name for display
+            sorted_characters = sorted(characters, key=lambda char: char.findtext("name", "zzz").lower())
+            for char in sorted_characters:
                 char_table.add_row(
                     char.get("id", "N/A"),
                     char.findtext("name", "N/A"),
@@ -1250,10 +1447,8 @@ Do not include any other text, explanations, or markdown. Just the JSON object.
                 "Word Count", style="magenta", justify="right"
             )  # New column
 
-            # Sort chapters by ID numerically before display
-            sorted_chapters_display = sorted(
-                chapters, key=lambda c: int(c.get("id", 0))
-            )
+            # Sort chapters by ID numerically before display (reuse sorted list from wc calc)
+            sorted_chapters_display = all_sorted_chapters # Use the list already sorted
 
             for chap in sorted_chapters_display:
                 chap_id = chap.get("id", "N/A")
@@ -1266,7 +1461,8 @@ Do not include any other text, explanations, or markdown. Just the JSON object.
                 )
                 # Check if paragraphs actually have non-empty text
                 has_real_content = any(p.text and p.text.strip() for p in paragraphs)
-                chap_wc = chapter_word_counts.get(chap_id, 0)  # Get pre-calculated wc
+                chap_wc = chapter_word_counts.get(chap_id, 0) if chap_id != "N/A" else _count_words(ET.tostring(content, method='text', encoding='unicode')) # Recalculate if no ID
+
 
                 summary_status = "[green]✓[/green]" if summary else "[red]✗[/red]"
                 content_status = (
@@ -1330,26 +1526,33 @@ Do not include any other text, explanations, or markdown. Just the JSON object.
         )
 
         # Create the prompt using current state (include idea/synopsis)
-        current_book_xml_for_prompt = ET.tostring(
-            self.book_root, encoding="unicode"
-        )  # Already includes title, synopsis, idea
+        # Create a minimal representation for the prompt to avoid excessive length
+        prompt_root = ET.Element("book")
+        ET.SubElement(prompt_root, "title").text = self.book_root.findtext("title", "")
+        ET.SubElement(prompt_root, "synopsis").text = self.book_root.findtext("synopsis", "")
+        initial_idea_elem = self.book_root.find("initial_idea")
+        if initial_idea_elem is not None and initial_idea_elem.text:
+             ET.SubElement(prompt_root, "initial_idea").text = initial_idea_elem.text
+        # Do NOT include existing chapters/characters in this specific prompt
+        current_book_xml_for_prompt = ET.tostring(prompt_root, encoding="unicode")
+
 
         prompt = f"""
 You are a creative assistant expanding an initial book concept into a full outline.
 The current minimal state of the book is:
 ```xml
-{current_book_xml_for_prompt}
+{escape(current_book_xml_for_prompt)}
 ```
 
 Based on the title, synopsis, and initial idea (if present), please generate the missing or incomplete parts of the outline, specifically:
-1.  A detailed `<characters>` section with multiple `<character>` elements (ID, name, description). Define the main characters and their arcs briefly. Use CamelCase or simple alphanumeric IDs (e.g., 'mainHero', 'villain').
+1.  A detailed `<characters>` section with multiple `<character>` elements (each with a unique alphanumeric `id`, `<name>`, `<description>`). Define the main characters and their arcs briefly. Use CamelCase or simple alphanumeric IDs (e.g., 'mainHero', 'villain'). Ensure IDs are unique.
 2.  A detailed `<chapters>` section containing approximately {num_chapters} `<chapter>` elements. For each chapter:
     *   Ensure it has a unique sequential string `id` (e.g., '1', '2', ...).
     *   Include `<number>` (matching the id), `<title>`, and a detailed `<summary>` (150-200 words) outlining key events and progression.
-    *   Keep the `<content>` tag EMPTY.
+    *   Keep the `<content>` tag EMPTY for now (like `<content/>` or `<content></content>`).
     *   Ensure the summaries form a coherent narrative arc (setup, rising action, climax, falling action, resolution).
 
-Output ONLY the complete `<book>` XML structure, merging the generated details with the existing title/synopsis/initial_idea. Do not include any text outside the `<book>` tags. Ensure IDs are correct.
+Output ONLY the complete `<book>` XML structure, merging the generated details with the existing title/synopsis/initial_idea provided in the input XML above. Do not include any text outside the `<book>` tags. Ensure chapter IDs are correct and sequential starting from 1. Ensure character IDs are unique. Strictly adhere to XML format.
 """
         response_xml_str = self._get_llm_response(prompt, "Generating full outline")
 
@@ -1485,33 +1688,37 @@ Output ONLY the complete `<book>` XML structure, merging the generated details w
                 else:
                     used_char_ids = set()
                     valid_chars_found = False
-                    for char in chars_elem.findall("character"):
-                        valid_chars_found = True
+                    for char in list(chars_elem.findall("character")): # Iterate over a list copy for safe removal
+                        valid_chars_found = True # Assume valid until proven otherwise
                         char_id = char.get("id")
                         name_elem = char.find("name")
                         name = (
-                            name_elem.text
+                            name_elem.text.strip()
                             if name_elem is not None
                             and name_elem.text
                             and name_elem.text.strip()
                             else None  # Mark as None if missing or empty
                         )
 
-                        if not name:  # Generate name if missing
+                        # Generate name if missing or empty
+                        if not name:
                             name = f"Character_{uuid.uuid4().hex[:4]}"
                             if name_elem is not None:
                                 name_elem.text = name
                             else:
-                                ET.SubElement(char, "name").text = name
+                                name_elem = ET.SubElement(char, "name")
+                                name_elem.text = name
                             console.print(
                                 f"[yellow]Warning: Character missing name. Assigned '{name}'.[/yellow]"
                             )
 
+                        # Generate unique ID if missing, empty, or duplicate
                         if (
                             not char_id
                             or not char_id.strip()
                             or char_id in used_char_ids
                         ):
+                            original_id_for_msg = char_id if char_id else "missing"
                             base_id = (
                                 slugify(name, allow_unicode=False).replace("-", "")
                                 or f"Char{uuid.uuid4().hex[:4]}"
@@ -1522,13 +1729,14 @@ Output ONLY the complete `<book>` XML structure, merging the generated details w
                                 new_id = f"{base_id}{counter}"
                                 counter += 1
                             console.print(
-                                f"[yellow]Warning: Character '{name}' missing/duplicate ID '{char_id}'. Setting unique ID to '{new_id}'.[/yellow]"
+                                f"[yellow]Warning: Character '{name}' has missing/duplicate ID ('{original_id_for_msg}'). Setting unique ID to '{new_id}'.[/yellow]"
                             )
                             char.set("id", new_id)
                             char_id = new_id  # Use the new one
+
                         used_char_ids.add(char_id)
 
-                        # Check description
+                        # Check description - add placeholder if missing or empty
                         desc_elem = char.find("description")
                         if desc_elem is None:
                             ET.SubElement(
@@ -1541,30 +1749,30 @@ Output ONLY the complete `<book>` XML structure, merging the generated details w
                         console.print(
                             "[yellow]Warning: Generated <characters> tag has no <character> elements.[/yellow]"
                         )
-                        validation_passed = (
-                            False  # Empty characters section is an issue
-                        )
+                        # Don't fail validation for this, maybe the story has no characters? Less likely but possible.
+
 
                 # Ensure Title/Synopsis/Idea exist (copy from original if LLM removed them)
                 for tag_info in [("title", 0), ("synopsis", 1), ("initial_idea", 2)]:
                     tag, default_pos = tag_info
                     if new_book_root.find(tag) is None:
+                        # Check the original self.book_root (before potential overwrite)
                         original_elem = self.book_root.find(tag)
                         insert_elem = None
-                        if original_elem is not None:
+                        if original_elem is not None and original_elem.text:
                             console.print(
-                                f"[yellow]Warning: LLM removed <{tag}>. Restoring from original.[/yellow]"
+                                f"[yellow]Warning: LLM removed <{tag}>. Restoring from original state.[/yellow]"
                             )
                             insert_elem = copy.deepcopy(original_elem)
                         else:
                             # Add placeholder if it was missing originally too
                             console.print(
-                                f"[yellow]Warning: LLM removed <{tag}> and it was missing originally. Adding placeholder.[/yellow]"
+                                f"[yellow]Warning: LLM removed <{tag}> or it was empty/missing. Adding placeholder.[/yellow]"
                             )
                             insert_elem = ET.Element(tag)
-                            insert_elem.text = (
-                                f"{tag.replace('_', ' ').title()} needed."
-                            )
+                            placeholder_text = f"{tag.replace('_', ' ').title()} needed."
+                            if tag == 'title': placeholder_text = "Placeholder Title"
+                            insert_elem.text = placeholder_text
 
                         if insert_elem is not None:
                             # Try to insert at a reasonable position
@@ -1581,17 +1789,12 @@ Output ONLY the complete `<book>` XML structure, merging the generated details w
                             # Ensure insert position is valid
                             insert_at = min(insert_at, len(new_book_root))
                             new_book_root.insert(insert_at, insert_elem)
-                        if tag in [
-                            "title",
-                            "synopsis",
-                        ]:  # Missing essential tags is an issue
+                        if tag in ["title"]: # Missing title is critical
                             validation_passed = False
 
                 # --- Commit Changes ---
-                if validation_passed:
-                    self.book_root = (
-                        new_book_root  # Replace current root with the validated one
-                    )
+                if validation_passed or Confirm.ask("[yellow]Outline validation found issues (see warnings). Save this outline anyway?[/yellow]", default=True):
+                    self.book_root = new_book_root # Replace current root
                     save_ok = self._save_book_state(
                         "outline.xml"
                     )  # Save as the definitive outline
@@ -1615,19 +1818,10 @@ Output ONLY the complete `<book>` XML structure, merging the generated details w
                         )
                         return False  # Indicate failure to save
 
-                else:
-                    console.print(
-                        "[bold red]Outline generation completed, but validation issues occurred (check warnings). Outline saved, but review recommended.[/bold red]"
-                    )
-                    # Still save the potentially problematic outline, but warn user
-                    self.book_root = new_book_root
-                    save_ok = self._save_book_state("outline.xml")
-                    self.patch_counter = 0
-                    self.chapters_generated_in_session.clear()
-                    # Even with validation errors, we consider the *step* completed, but maybe return False if critical?
-                    # For now, let's return True to allow proceeding, but user is warned.
-                    self._display_summary()  # Display potentially problematic summary
-                    return save_ok  # Return True if saved, False otherwise
+                else: # Validation failed and user chose not to save
+                     console.print("[red]Outline generation failed validation and was discarded by user.[/red]")
+                     return False # Indicate failure
+
 
             else:
                 console.print(
@@ -1636,7 +1830,7 @@ Output ONLY the complete `<book>` XML structure, merging the generated details w
                 return False
         else:
             console.print(
-                "[bold red]Failed to get a valid response from the LLM for the outline.[/bold red]"
+                f"[bold red]Failed to get a valid response from the {self.api_type.upper()} for the outline.[/bold red]"
             )
             return False
 
@@ -1757,8 +1951,8 @@ Output ONLY the complete `<book>` XML structure, merging the generated details w
 
         while True:
             chapters_to_generate = self._select_chapters_to_generate(
-                batch_size=5
-            )  # Increased batch size example
+                batch_size=3 # Slightly smaller batch size might improve consistency/reduce token usage per call
+            )
 
             if not chapters_to_generate:
                 # Double check if any are *really* missing content based on the precise definition
@@ -1806,22 +2000,24 @@ Output ONLY the complete `<book>` XML structure, merging the generated details w
                 chap_num = chapter_element.findtext("number", "N/A")
                 chap_title = chapter_element.findtext("title", "N/A")
                 chap_summary = chapter_element.findtext("summary", "N/A")
-                chapter_details_prompt += f'- Chapter {chap_num} (ID: {chap_id}): "{chap_title}"\n  Summary: {chap_summary}\n'
+                chapter_details_prompt += f'- Chapter {chap_num} (ID: {chap_id}): "{escape(chap_title)}"\n  Summary: {escape(chap_summary)}\n'
 
+            # Create a context representation - potentially prune older chapters if context gets too large
+            # For now, send the whole book state. Be mindful of token limits.
             current_book_xml_str = ET.tostring(self.book_root, encoding="unicode")
 
-            # Adjusted word count goal
+            # Adjusted word count goal - more flexible instruction
             prompt = f"""
 You are a novelist continuing the story based on the full book context provided below.
 Your task is to write the full prose content for the following {len(chapters_to_generate)} chapters:
 {chapter_details_prompt}
 
 Guidelines:
-- Write detailed and engaging prose for each chapter, aiming for a substantial length appropriate for a novel chapter (e.g., 1500-4000 words *per chapter*). Adjust length based on the chapter's summary and importance within the narrative arc.
+- Write detailed and engaging prose for each chapter, aiming for a substantial length appropriate for a novel chapter (e.g., ~1500-3500 words *per chapter*). Use the summary as a guide for the required detail and length. Focus on quality over hitting an exact word count.
 - Maintain consistency with the established plot, characters (personalities, motivations, relationships), tone, and writing style evident in the rest of the book context (including summaries of unwritten chapters and content of written ones).
 - Ensure the events of these chapters align with their summaries and logically connect preceding/succeeding chapters. Pay attention to how these chapters function together within the narrative arc.
-- For EACH chapter you generate content for, structure it within `<content>` tags, divided into paragraphs using `<paragraph>` tags. Each paragraph tag MUST have a unique sequential `id` attribute within that chapter (e.g., `<paragraph id="1">...</paragraph>`, `<paragraph id="2">...</paragraph>`, etc.). Start paragraph IDs from "1" for each chapter. Ensure paragraphs contain meaningful text.
-- Output ONLY an XML `<patch>` structure containing the `<chapter>` elements for the requested chapters. Each `<chapter>` element must have the correct `id` attribute and contain the fully generated `<content>` tag with its `<paragraph>` children. DO NOT include chapters that were not requested in this batch.
+- For EACH chapter you generate content for, structure it within `<content>` tags, divided into paragraphs using `<paragraph>` tags. Each paragraph tag MUST have a unique sequential `id` attribute within that chapter (e.g., `<paragraph id="1">...</paragraph>`, `<paragraph id="2">...</paragraph>`, etc.). Start paragraph IDs from "1" for each chapter. Ensure paragraphs contain meaningful text and are not overly short unless stylistically required (e.g., dialogue).
+- Output ONLY an XML `<patch>` structure containing the `<chapter>` elements for the requested chapters. Each `<chapter>` element must have the correct `id` attribute and contain the fully generated `<content>` tag with its `<paragraph>` children. DO NOT include chapters that were not requested in this batch. DO NOT include XML comments unless absolutely necessary for structure clarification. Strictly adhere to XML format.
 
 Example Output Format:
 <patch>
@@ -1844,10 +2040,10 @@ Example Output Format:
 
 Full Book Context (including outline and any previously generated chapters):
 ```xml
-{current_book_xml_str}
+{escape(current_book_xml_str)}
 ```
 
-Generate the `<patch>` XML containing the content for the requested chapters now. Ensure all specified chapters are included in the response patch with correct IDs and paragraph structure. Ensure generated paragraphs have sequential IDs starting from 1 for each chapter and contain text.
+Generate the `<patch>` XML containing the content for the requested chapters now ({chapter_ids_str}). Ensure all specified chapters are included in the response patch with correct IDs and valid paragraph structure (sequential IDs starting from 1, non-empty text). Output ONLY the XML structure.
 """
 
             response_patch_xml_str = self._get_llm_response(
@@ -1859,7 +2055,7 @@ Generate the `<patch>` XML containing the content for the requested chapters now
             # Check if response was obtained (handles None return from _get_llm_response)
             if response_patch_xml_str is None:
                 console.print(
-                    f"[bold red]Failed to get response from LLM for batch starting with Chapter {chapters_to_generate[0].get('id')}.[/bold red]"
+                    f"[bold red]Failed to get response from {self.api_type.upper()} for batch starting with Chapter {chapters_to_generate[0].get('id')}.[/bold red]"
                 )
                 # _get_llm_response handles the confirmation to retry/abort. If it returns None, it failed definitively.
                 if not Confirm.ask(
@@ -1913,7 +2109,8 @@ Generate the `<patch>` XML containing the content for the requested chapters now
                     return False  # Indicate failure to continue
                 # else: continue loop to try next batch
 
-            time.sleep(1)  # Small delay between batches
+            # Optional small delay between batches to avoid hitting rate limits
+            time.sleep(2) # Increase delay slightly
 
         return True  # Indicate chapter generation phase completed (even if nothing was generated or some batches failed)
 
@@ -1952,16 +2149,21 @@ Generate the `<patch>` XML containing the content for the requested chapters now
         """Prompts user for chapter IDs and validates them."""
         if self.book_root is None:
             return []
-        all_chapter_ids = {
-            chap.get("id") for chap in self.book_root.findall(".//chapter")
-        }
+        all_chapters_elements = self.book_root.findall(".//chapter")
+        all_chapter_ids = {chap.get("id") for chap in all_chapters_elements if chap.get("id")}
         if not all_chapter_ids:
             console.print("[yellow]No chapters found in the book.[/yellow]")
             return []
 
+        # Sort IDs numerically for display
+        try:
+             sorted_ids_str = ", ".join(sorted(all_chapter_ids, key=int))
+        except ValueError: # Handle non-integer IDs if they somehow exist
+             sorted_ids_str = ", ".join(sorted(list(all_chapter_ids)))
+
         while True:
             raw_input = Prompt.ask(
-                f"{prompt_text} (Available: {', '.join(sorted(all_chapter_ids, key=int))})"
+                f"{prompt_text} (Available: {sorted_ids_str})"
             )
             selected_ids_str = [s.strip() for s in raw_input.split(",") if s.strip()]
 
@@ -2010,18 +2212,23 @@ Generate the `<patch>` XML containing the content for the requested chapters now
         if not selected_chapters:
             return  # User cancelled or no chapters
 
+        # Calculate current average word count for suggestion
+        num_selected = len(selected_chapters)
+        current_selected_wc = 0
+        chapter_ids_for_wc = [c.get("id") for c in selected_chapters]
+        for chap_id in chapter_ids_for_wc:
+            chap = find_chapter(self.book_root, chap_id)
+            if chap:
+                content = chap.find("content")
+                if content:
+                    current_selected_wc += sum(_count_words(p.text) for p in content.findall(".//paragraph"))
+
+        current_avg_wc = (current_selected_wc / num_selected) if num_selected > 0 else 2000 # Default if no content yet
+        suggested_target_wc = max(3000, math.ceil(current_avg_wc * 1.5))
+
         target_word_count = IntPrompt.ask(
-            "[yellow]Enter target word count per chapter[/yellow]",
-            default=max(
-                3000,
-                math.ceil(
-                    self.total_word_count
-                    / len(self.book_root.findall(".//chapter"))
-                    * 1.5
-                )
-                if self.total_word_count > 0
-                else 3000,
-            ),  # Suggest 50% increase or 3000
+            f"[yellow]Enter target word count per chapter[/yellow] (current avg: ~{current_avg_wc:,.0f})",
+            default=suggested_target_wc,
         )
         if target_word_count <= 0:
             console.print("[red]Invalid word count.[/red]")
@@ -2035,10 +2242,11 @@ Generate the `<patch>` XML containing the content for the requested chapters now
             chap_title = chapter_element.findtext("title", "N/A")
             chap_summary = chapter_element.findtext("summary", "N/A")
             chapter_ids.append(chap_id)
-            # Include existing content for context? Yes, better for expansion.
+            # Include existing content for context
             existing_content_xml = ""
             content_elem = chapter_element.find("content")
             if content_elem is not None:
+                # Limit context size slightly if needed, maybe only first/last N paras? For now, full content.
                 existing_content_xml = ET.tostring(content_elem, encoding="unicode")
 
             chapter_details_prompt += f"""
@@ -2046,8 +2254,9 @@ Generate the `<patch>` XML containing the content for the requested chapters now
   <number>{chap_num}</number>
   <title>{escape(chap_title)}</title>
   <summary>{escape(chap_summary)}</summary>
-  <!-- Existing Content -->
-  {existing_content_xml}
+  <!-- Existing Content Start -->
+  {escape(existing_content_xml)}
+  <!-- Existing Content End -->
 </chapter>
 """
 
@@ -2057,22 +2266,22 @@ You are a novelist tasked with expanding specific chapters of a manuscript.
 Your goal is to rewrite the *entire content* for the chapter(s) listed below, significantly increasing their length to approximately {target_word_count:,} words *each*, while enriching the detail, description, dialogue, and internal monologue.
 
 Chapters to Expand (including their original content for context):
----
+--- XML START ---
 {chapter_details_prompt}
----
+--- XML END ---
 
 Guidelines:
-- Rewrite the full `<content>` for EACH specified chapter ({", ".join(chapter_ids)}).
+- Rewrite the full `<content>` for EACH specified chapter ({", ".join(chapter_ids)}). Replace the existing content entirely.
 - Target word count: Approximately {target_word_count:,} words per chapter.
 - Elaborate on existing scenes, add descriptive details, deepen character thoughts/feelings, expand dialogues, and potentially add small connecting scenes *within* the chapter's scope if necessary to reach the target length naturally.
 - Maintain absolute consistency with the overall plot, established characters, tone, and style provided in the full book context below. The expansion should feel seamless.
 - Ensure the rewritten chapter still fulfills the purpose outlined in its original summary.
 - Structure the rewritten content within `<content>` tags, using sequentially numbered `<paragraph id="...">` tags starting from 1 for each chapter. Ensure paragraphs contain text.
-- Output ONLY the XML `<patch>` structure containing the rewritten `<chapter>` elements (with their new, full `<content>`). Do not include chapters not specified.
+- Output ONLY the XML `<patch>` structure containing the rewritten `<chapter>` elements (with their new, full `<content>`). Do not include chapters not specified. Do not output any text before `<patch>` or after `</patch>`. Strictly adhere to XML format.
 
 Full Book Context:
 ```xml
-{current_book_xml_str}
+{escape(current_book_xml_str)}
 ```
 
 Generate the `<patch>` XML now.
@@ -2100,7 +2309,7 @@ Generate the `<patch>` XML now.
         chapter_id = target_chapter.get("id")
 
         instructions = Prompt.ask(
-            "[yellow]Enter specific instructions for the rewrite[/yellow]"
+            f"[yellow]Enter specific instructions for the {mode.lower()}[/yellow]"
         )
         if not instructions.strip():
             console.print("[red]No instructions provided. Aborting rewrite.[/red]")
@@ -2108,39 +2317,47 @@ Generate the `<patch>` XML now.
 
         # --- Prepare Context ---
         current_book_xml_str = ""
+        temp_book_root_for_prompt = copy.deepcopy(self.book_root) # Always make a copy for prompt context modification
+        target_chapter_in_prompt_copy = find_chapter(temp_book_root_for_prompt, chapter_id)
+
+        if target_chapter_in_prompt_copy is None:
+             console.print(f"[red]Error: Could not find chapter {chapter_id} in temporary copy for prompt. Aborting.[/red]")
+             return
+
         if blackout:
             console.print(
                 "[yellow]Preparing context with target chapter content removed (fresh rewrite)...[/yellow]"
             )
-            temp_book_root = copy.deepcopy(self.book_root)
-            target_chapter_copy = find_chapter(temp_book_root, chapter_id)
-            if target_chapter_copy is not None:
-                content_elem_copy = target_chapter_copy.find("content")
-                if content_elem_copy is not None:
-                    content_elem_copy.clear()
-                    content_elem_copy.text = None  # Explicitly clear text too
-                    console.print(
-                        f"[dim]Content of chapter {chapter_id} removed for prompt context.[/dim]"
-                    )
-                else:
-                    console.print(
-                        f"[yellow]Warning: Chapter {chapter_id} has no <content> tag in temporary copy.[/yellow]"
-                    )
-            else:
-                # Should not happen given validation, but safety check
+            content_elem_copy = target_chapter_in_prompt_copy.find("content")
+            if content_elem_copy is not None:
+                target_chapter_in_prompt_copy.remove(content_elem_copy) # Remove the content element entirely for blackout
+                # Add back an empty one for clarity in the prompt context if desired, or leave it out. Let's add an empty one.
+                ET.SubElement(target_chapter_in_prompt_copy, "content")
                 console.print(
-                    f"[red]Error: Could not find chapter {chapter_id} in temporary copy for fresh rewrite. Aborting.[/red]"
+                    f"[dim]Content of chapter {chapter_id} removed for prompt context.[/dim]"
                 )
-                return
-            current_book_xml_str = ET.tostring(temp_book_root, encoding="unicode")
-        else:
-            # Standard rewrite: use full context
-            current_book_xml_str = ET.tostring(self.book_root, encoding="unicode")
+            else:
+                console.print(
+                    f"[yellow]Warning: Chapter {chapter_id} has no <content> tag in temporary copy to remove.[/yellow]"
+                )
+                # Add an empty one anyway to signify it should be generated
+                ET.SubElement(target_chapter_in_prompt_copy, "content")
+
+        current_book_xml_str = ET.tostring(temp_book_root_for_prompt, encoding="unicode")
+
 
         # --- Prepare Prompt ---
         chap_num = target_chapter.findtext("number", "N/A")
         chap_title = target_chapter.findtext("title", "N/A")
         chap_summary = target_chapter.findtext("summary", "N/A")
+
+        # Get original content XML only if *not* blackout, for user reference in prompt
+        original_content_xml_for_prompt = ""
+        if not blackout:
+            original_content_elem = target_chapter.find("content")
+            if original_content_elem is not None:
+                original_content_xml_for_prompt = ET.tostring(original_content_elem, encoding="unicode")
+
 
         rewrite_context_info = f"""
 Chapter to Rewrite:
@@ -2149,14 +2366,11 @@ Chapter to Rewrite:
 - Title: {escape(chap_title)}
 - Summary: {escape(chap_summary)}
 """
-        if not blackout:  # Include original content if not blackout
-            original_content_xml = ""
-            content_elem = target_chapter.find("content")
-            if content_elem is not None:
-                original_content_xml = ET.tostring(content_elem, encoding="unicode")
-            rewrite_context_info += (
-                f"<!-- Original Content -->\n{original_content_xml}\n"
-            )
+        if not blackout and original_content_xml_for_prompt:
+            rewrite_context_info += f"""
+<!-- Original Content for Reference -->
+{escape(original_content_xml_for_prompt)}
+"""
 
         prompt = f"""
 You are a novelist rewriting a specific chapter based on user instructions.
@@ -2168,17 +2382,17 @@ User's Rewrite Instructions:
 ---
 {escape(instructions)}
 ---
-{"*Note: The original content of this chapter was intentionally removed from the context below to encourage a fresh perspective based on the summary and instructions.*" if blackout else ""}
+{"*Note: The original content of this chapter was intentionally removed from the full book context below (though shown above for your reference if available) to encourage a fresh perspective based on the summary and instructions.*" if blackout else ""}
 
 Guidelines:
-- Rewrite the full `<content>` for Chapter {chapter_id} according to the instructions.
+- Rewrite the full `<content>` for Chapter {chapter_id} according to the instructions, replacing the original content entirely.
 - Ensure the rewritten chapter aligns with its summary and maintains consistency with the overall plot, characters, tone, and style provided in the full book context below.
-- Structure the rewritten content within `<content>` tags, using sequentially numbered `<paragraph id="...">` tags starting from 1. Ensure paragraphs contain text.
-- Output ONLY the XML `<patch>` structure containing the single rewritten `<chapter>` element (ID: {chapter_id}) with its new, full `<content>`.
+- Structure the rewritten content within `<content>` tags, using sequentially numbered `<paragraph id="...">` tags starting from 1. Ensure paragraphs contain meaningful text.
+- Output ONLY the XML `<patch>` structure containing the single rewritten `<chapter>` element (ID: {chapter_id}) with its new, full `<content>`. Do not output any text before `<patch>` or after `</patch>`. Strictly adhere to XML format.
 
-Full Book Context {"(Chapter " + chapter_id + " content removed)" if blackout else ""}:
+Full Book Context {"(Chapter " + chapter_id + " content removed/empty)" if blackout else ""}:
 ```xml
-{current_book_xml_str}
+{escape(current_book_xml_str)}
 ```
 
 Generate the `<patch>` XML for the rewritten Chapter {chapter_id} now.
@@ -2191,6 +2405,43 @@ Generate the `<patch>` XML for the rewritten Chapter {chapter_id} now.
             apply_success = self._apply_patch(suggested_patch_xml_str)
             self._handle_patch_result(apply_success, f"{mode} (Ch {chapter_id})")
 
+    def _is_patch_effectively_empty(self, patch_xml_str):
+        """Checks if a patch string is empty, fails to parse, or only contains comments."""
+        if not patch_xml_str or not patch_xml_str.strip():
+            return True # Definitely empty
+
+        # Attempt to clean and parse first
+        # Use attempt_clean=False because cleaning should happen before this check
+        patch_elem = parse_xml_string(patch_xml_str, expected_root_tag="patch", attempt_clean=False)
+
+        if patch_elem is None:
+            console.print("[dim]Patch check: Parsing failed, considered empty/invalid.[/dim]")
+            return True # Parse failure means invalid patch
+
+        # Check if the <patch> element has no children
+        if not list(patch_elem):
+            console.print("[dim]Patch check: Root <patch> element has no children, considered empty.[/dim]")
+            return True # No children means empty patch
+
+        # Check if *all* direct children of the <patch> element are comments
+        # ET.Comment is for <!-- -->, ET.ProcessingInstruction for <? ... ?>
+        # We only care about comments indicating no change.
+        # Note: ET._Comment_Tag might be needed for older Python/ET versions if ET.Comment fails
+        # Safest check: iterate and see if any non-comment element exists
+        has_non_comment_child = False
+        for child in patch_elem:
+             # Check if it's an Element and not a Comment
+             if isinstance(child.tag, str) and child.tag != ET.Comment:
+                  has_non_comment_child = True
+                  break # Found a real element, patch is not just comments
+
+        if not has_non_comment_child:
+             console.print("[dim]Patch check: Root <patch> element only contains comments (or is empty), considered empty.[/dim]")
+             return True # Only comments found
+
+        console.print("[dim]Patch check: Found non-comment elements, considered valid patch.[/dim]")
+        return False # Found actual elements, not an empty/comment-only patch
+
     def _edit_suggest_edits(self):
         """Handler for asking the LLM for edit suggestions."""
         console.print(Panel("Edit Option: Ask LLM for Suggestions", style="cyan"))
@@ -2201,29 +2452,30 @@ Generate the `<patch>` XML for the rewritten Chapter {chapter_id} now.
 
         # --- Prompt 1: Get Suggestions ---
         prompt_suggest = f"""
-You are an expert editor reviewing the novel manuscript provided below.
-Analyze the entire book context (plot, pacing, character arcs, consistency, style, clarity, dialogue, descriptions).
+You are an expert editor reviewing the novel manuscript provided below in XML format.
+Analyze the entire book context (plot, pacing, character arcs, consistency, style, clarity, dialogue, descriptions, potential plot holes).
 Identify potential areas for improvement.
-Provide a numbered list of 5-10 concrete, actionable suggestions for specific edits. Keep suggestions concise (1-2 sentences each). Focus on high-impact changes.
+Provide a numbered list of 5-10 concrete, actionable suggestions for specific edits. Keep suggestions concise (1-2 sentences each). Focus on high-impact changes. Reference specific chapter IDs or character IDs where possible.
 
 Example Suggestion Format:
 1. Strengthen the foreshadowing in Chapter 3 regarding the villain's true motives.
 2. Improve the pacing of the chase scene in Chapter 12 by shortening descriptive paragraphs.
-3. Make Character A's dialogue in Chapter 5 sound more hesitant to reflect their uncertainty.
+3. Make Character 'heroProtagonist' dialogue in Chapter 5 sound more hesitant to reflect their uncertainty.
+4. Consider adding a brief scene in Chapter 7 showing Character 'sidekickFriend' reaction to the news.
 
 Full Book Context:
 ```xml
-{current_book_xml_str}
+{escape(current_book_xml_str)}
 ```
 
-Generate the numbered list of edit suggestions now. Output ONLY the list.
+Generate the numbered list of edit suggestions now. Output ONLY the list. Do not include greetings or explanations.
 """
         suggestions_text = self._get_llm_response(
             prompt_suggest, "Generating edit suggestions list", allow_stream=False
         )
 
         if not suggestions_text or not suggestions_text.strip():
-            console.print("[red]Could not get suggestions from the LLM.[/red]")
+            console.print(f"[red]Could not get suggestions from the {self.api_type.upper()}.[/red]")
             return
 
         # --- Parse and Display Suggestions ---
@@ -2242,7 +2494,7 @@ Generate the numbered list of edit suggestions now. Output ONLY the list.
 
         if not suggestions:
             console.print(
-                "[yellow]LLM response did not contain a parsable list of suggestions.[/yellow]"
+                f"[yellow]{self.api_type.upper()} response did not contain a parsable list of suggestions.[/yellow]"
             )
             console.print("[dim]LLM Raw Response:[/dim]")
             console.print(f"[dim]{suggestions_text[:1000]}[/dim]")
@@ -2281,11 +2533,10 @@ Generate the numbered list of edit suggestions now. Output ONLY the list.
         )
 
         # --- Prompt 2: Implement Chosen Suggestion ---
-        # Reuse the general edit prompt structure
         prompt_implement = f"""
-You are an expert editor implementing a specific suggestion on the novel provided below.
+You are an expert editor implementing a specific suggestion on the novel provided below in XML format.
 
-Editing Suggestion to Implement: {cleaned_suggestion}
+Editing Suggestion to Implement: {escape(cleaned_suggestion)}
 
 Guidelines for Patch:
 - Analyze the entire book context provided.
@@ -2293,25 +2544,29 @@ Guidelines for Patch:
 - Patches can modify chapters or paragraphs.
     - Full chapter replace: `<patch><chapter id="..."><content><paragraph id="1">...</paragraph>...</content></chapter></patch>` (Ensure new para IDs are sequential from 1, ensure text).
     - Paragraph replace: `<patch><chapter id="..."><content-patch><paragraph id="para_id">...</paragraph></content-patch></chapter></patch>` (Ensure replacement para has text).
-    - Top-level changes (Title, Synopsis, Characters): Use appropriate tags within `<patch>`. Characters list is usually replaced wholesale.
-- Be specific and target the changes accurately based on the suggestion.
-- Use XML comments `<!-- ... -->` within the patch if brief justification is needed.
-- If the suggestion cannot be directly translated to a patch (e.g., too vague), output an empty patch `<patch />` with a comment explaining why.
+    - Top-level changes (Title, Synopsis, Characters): Use appropriate tags within `<patch>`. Characters list is usually replaced wholesale if the suggestion warrants it.
+- Be specific and target the changes accurately based on the suggestion. Reference chapter/paragraph/character IDs accurately in the patch.
+- Use XML comments `<!-- ... -->` within the patch ONLY if brief justification is absolutely needed for clarity. Avoid comments otherwise.
+- If the suggestion cannot be directly translated to a patch (e.g., too vague, requires complex structural changes beyond simple replacement), output an empty patch `<patch/>` with a comment explaining why.
+- Output ONLY the patch XML. Do not output any text before `<patch>` or after `</patch>`. Strictly adhere to XML format.
 
 Full Book Context:
 ```xml
-{current_book_xml_str}
+{escape(current_book_xml_str)}
 ```
 
-Generate the `<patch>` XML to implement the suggestion now. Output ONLY the patch XML.
+Generate the `<patch>` XML to implement the suggestion now. Output ONLY the patch XML structure.
 """
-        suggested_patch_xml_str = self._get_llm_response(
+        suggested_patch_xml_str_raw = self._get_llm_response(
             prompt_implement,
             f"Implementing Suggestion {chosen_num}",
-            allow_stream=False,
+            allow_stream=False, # Patch should be small enough for non-stream
         )
 
-        if suggested_patch_xml_str:
+        if suggested_patch_xml_str_raw:
+             # Clean the raw response *before* checking if it's empty or displaying
+            cleaned_patch_str = clean_llm_xml_output(suggested_patch_xml_str_raw)
+
             console.print(
                 Panel(
                     f"[bold cyan]Suggested Patch for Suggestion {chosen_num}:[/bold cyan]",
@@ -2319,35 +2574,28 @@ Generate the `<patch>` XML to implement the suggestion now. Output ONLY the patc
                 )
             )
             syntax = Syntax(
-                suggested_patch_xml_str, "xml", theme="default", line_numbers=True
+                cleaned_patch_str, "xml", theme="default", line_numbers=True
             )
             console.print(syntax)
 
-            is_empty_or_comment = False
-            try:
-                patch_elem = parse_xml_string(suggested_patch_xml_str, "patch")
-                if patch_elem is None:
-                    is_empty_or_comment = True  # Treat parse failure as empty/failed
-                elif not list(patch_elem) or all(
-                    child.tag is ET.Comment for child in patch_elem
-                ):
-                    is_empty_or_comment = True
-            except Exception:
-                is_empty_or_comment = True  # Treat errors as empty
-
-            if is_empty_or_comment:
+            # Use the helper function to check if the *cleaned* patch is effectively empty
+            if self._is_patch_effectively_empty(cleaned_patch_str):
                 console.print(
-                    "[yellow]LLM indicated no changes needed or could not generate a patch for this suggestion.[/yellow]"
+                    f"[yellow]{self.api_type.upper()} indicated no changes needed or could not generate a valid patch for this suggestion.[/yellow]"
                 )
             elif Confirm.ask(
                 "\n[yellow]Apply this suggested patch? [/yellow]", default=True
             ):
-                apply_success = self._apply_patch(suggested_patch_xml_str)
+                # Apply the cleaned string
+                apply_success = self._apply_patch(cleaned_patch_str)
                 self._handle_patch_result(
                     apply_success, f"Implement Suggestion {chosen_num}"
                 )
             else:
                 console.print("Suggested patch discarded.")
+        else:
+             # Handle case where LLM response itself was None/empty
+             console.print(f"[red]Failed to get patch suggestion response from {self.api_type.upper()}.[/red]")
 
     def _edit_general_llm(self):
         """Handler for general LLM editing based on user instructions."""
@@ -2366,7 +2614,7 @@ Generate the `<patch>` XML to implement the suggestion now. Output ONLY the patc
 You are an expert editor reviewing the novel provided below in XML format.
 Your task is to analyze the text based on the user's instructions and generate an XML patch with specific changes.
 
-User's Editing Instructions: {instructions}
+User's Editing Instructions: {escape(instructions)}
 
 Guidelines for Patch:
 - Analyze the entire book context provided.
@@ -2379,22 +2627,26 @@ Guidelines for Patch:
       `<patch><chapter id="chap_id"><content-patch><paragraph id="para_id">New text for this para</paragraph>...</content-patch></chapter></patch>` (Ensure replacement paragraph has text).
     - Ensure paragraph IDs referenced in `<content-patch>` exist in the original chapter.
 - If suggesting changes to Title, Synopsis, or Characters, use the appropriate top-level tags within the `<patch>` tag (e.g., `<patch><title>New Title</title>...</patch>`). Characters should generally be replaced as a whole list: `<patch><characters><character id="newId1">...</character>...</characters></patch>`.
-- Be specific and justify changes briefly if possible using XML comments: `<!-- Suggestion: Rephrased for clarity -->`.
-- If no significant changes are needed based on the instructions, output an empty patch like `<patch />` or a patch with only comments: `<patch><!-- No major changes suggested --></patch>`
+- Be specific and justify changes briefly ONLY if necessary using XML comments: `<!-- Suggestion: Rephrased for clarity -->`. Avoid comments otherwise.
+- If no significant changes are needed based on the instructions, output an empty patch like `<patch/>` or a patch with only comments: `<patch><!-- No major changes suggested --></patch>`
+- Output ONLY the patch XML. Do not output any text before `<patch>` or after `</patch>`. Strictly adhere to XML format.
 
 Full Book Context:
 ```xml
-{current_book_xml_str}
+{escape(current_book_xml_str)}
 ```
 
-Generate the `<patch>` XML containing your suggested edits now. Output ONLY the patch XML.
+Generate the `<patch>` XML containing your suggested edits now. Output ONLY the patch XML structure.
 """
 
-        suggested_patch_xml_str = self._get_llm_response(
-            prompt, "Generating general edit patch", allow_stream=False
+        suggested_patch_xml_str_raw = self._get_llm_response(
+            prompt, "Generating general edit patch", allow_stream=False # Patch should be small
         )
 
-        if suggested_patch_xml_str:
+        if suggested_patch_xml_str_raw:
+            # Clean the raw response *before* checking if it's empty or displaying
+            cleaned_patch_str = clean_llm_xml_output(suggested_patch_xml_str_raw)
+
             console.print(
                 Panel(
                     "[bold cyan]Suggested Edits (Patch XML):[/bold cyan]",
@@ -2402,36 +2654,28 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
                 )
             )
             syntax = Syntax(
-                suggested_patch_xml_str, "xml", theme="default", line_numbers=True
+                cleaned_patch_str, "xml", theme="default", line_numbers=True
             )
             console.print(syntax)
 
-            is_empty_or_comment_patch = False
-            try:
-                patch_elem = parse_xml_string(
-                    suggested_patch_xml_str, expected_root_tag="patch"
-                )
-                if patch_elem is None:
-                    is_empty_or_comment_patch = True
-                elif not list(patch_elem) or all(
-                    child.tag is ET.Comment for child in patch_elem
-                ):
-                    is_empty_or_comment_patch = True
-            except Exception:
-                is_empty_or_comment_patch = True
-
-            if is_empty_or_comment_patch:
+            # Use the helper function to check if the *cleaned* patch is effectively empty
+            if self._is_patch_effectively_empty(cleaned_patch_str):
                 console.print(
-                    "[cyan]LLM suggested no specific changes or only provided comments.[/cyan]"
+                    f"[cyan]{self.api_type.upper()} suggested no specific changes or only provided comments.[/cyan]"
                 )
             elif Confirm.ask(
                 "\n[yellow]Do you want to apply these suggested changes? [/yellow]",
                 default=True,
             ):
-                apply_success = self._apply_patch(suggested_patch_xml_str)
+                # Apply the cleaned string
+                apply_success = self._apply_patch(cleaned_patch_str)
                 self._handle_patch_result(apply_success, "General Edit")
             else:
                 console.print("Suggested patch discarded.")
+        else:
+             # Handle case where LLM response itself was None/empty
+             console.print(f"[red]Failed to get general edit patch response from {self.api_type.upper()}.[/red]")
+
 
     # --- Step 3: Editing (Main Loop) ---
     def edit_book(self):
@@ -2526,21 +2770,38 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
 """
 
             characters = self.book_root.findall(".//character")
+             # Sort characters by name for display
+            sorted_characters = sorted(characters, key=lambda char: char.findtext("name", "zzz").lower())
+
             chapters_raw = self.book_root.findall(".//chapter")
-            chapters = sorted(chapters_raw, key=lambda c: int(c.get("id", 0)))
+            # Sort chapters numerically for display/calculation
+            sorted_chapters_display = []
+            invalid_id_chapters = []
+            for c in chapters_raw:
+                try:
+                    int(c.get("id", "NaN"))
+                    sorted_chapters_display.append(c)
+                except ValueError:
+                    invalid_id_chapters.append(c)
+            sorted_chapters_display.sort(key=lambda c: int(c.get("id")))
+            chapters = sorted_chapters_display + invalid_id_chapters
+
 
             # Calculate word counts for HTML
             total_wc_html = 0
             chapter_wc_html = {}
-            for chap in chapters:
+            for chap in chapters: # Use the sorted list
                 chap_id = chap.get("id")
                 content = chap.find("content")
                 chap_wc = 0
                 if content is not None:
                     for para in content.findall(".//paragraph"):
                         chap_wc += _count_words(para.text)
-                chapter_wc_html[chap_id] = chap_wc
-                total_wc_html += chap_wc
+                if chap_id:
+                    chapter_wc_html[chap_id] = chap_wc
+                    total_wc_html += chap_wc
+                else:
+                     total_wc_html += chap_wc # Add to total even if no ID
 
             html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -2567,11 +2828,13 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
         .chapter-title {{ font-weight: 600; }} /* Slightly bolder chapter titles */
         .chapter-meta {{ font-size: 0.8em; color: #aaa; margin-left: 10px; font-family: monospace; }} /* Show chapter ID subtly */
         .chapter-word-count {{ font-weight: normal; color: #777; }}
+        .api-info {{ text-align: center; font-size: 0.8em; color: #888; margin-bottom: 20px; font-family: monospace; }}
     </style>
 </head>
 <body>
     <h1>{title}</h1>
     <div class="total-word-count">Total Word Count: {total_wc_html:,}</div>
+    <div class="api-info">Generated/Edited using: API=[{escape(self.api_type)}], Model=[{escape(self.model_name)}]</div>
 
     <div class="synopsis">
         <h2>Synopsis</h2>
@@ -2580,7 +2843,7 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
 {initial_idea_html}
     <div class="characters">
         <h2>Characters</h2>
-        {f"<ul>{''.join(f'<li><b>{escape(c.findtext("name", "N/A"))}</b> (ID: {escape(c.get("id", "N/A"))}): {escape(c.findtext("description", "N/A"))}</li>' for c in characters)}</ul>" if characters else '<p class="missing-content">No characters defined.</p>'}
+        {f"<ul>{''.join(f'<li><b>{escape(c.findtext("name", "N/A"))}</b> (ID: {escape(c.get("id", "N/A"))}): {escape(c.findtext("description", "N/A"))}</li>' for c in sorted_characters)}</ul>" if sorted_characters else '<p class="missing-content">No characters defined.</p>'}
     </div>
 
     <hr>
@@ -2589,7 +2852,7 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
         <h2>Chapters</h2>
 """
             if chapters:
-                for chap in chapters:
+                for chap in chapters: # Iterate through the sorted list
                     chap_id = escape(chap.get("id", "N/A"))
                     chap_num = escape(
                         chap.findtext("number", chap_id)
@@ -2654,12 +2917,7 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
             )
         )
 
-        # Ensure client is initialized
-        if self.client is None:
-            console.print(
-                "[bold red]Gemini client failed to initialize. Cannot continue.[/bold red]"
-            )
-            return
+        # Client initialization is checked in __init__
 
         # Ensure book root is loaded/initialized
         if self.book_root is None:
@@ -2677,7 +2935,7 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
         )
         has_summaries = has_chapters and any(
             c.findtext("summary", "").strip()
-            for c in chapters_element.findall(".//chapter")
+            for c in chapters_element.findall("chapter")
         )
         has_characters = self.book_root.find(".//characters") is not None and bool(
             self.book_root.findall(".//character")
@@ -2911,22 +3169,60 @@ if __name__ == "__main__":
     console.print(Panel("📚 Novel Writer Setup 📚", style="blue"))
 
     # --- Command Line Argument Parsing ---
-    parser = argparse.ArgumentParser(description="Interactive Novel Writer using LLMs.")
+    parser = argparse.ArgumentParser(
+        description="Interactive Novel Writer using LLMs.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter # Show defaults in help
+        )
+    parser.add_argument(
+        "--api",
+        type=str.lower, # Convert to lowercase
+        choices=['gemini', 'openai'],
+        default='gemini', # Default to Gemini
+        help="Which API provider to use.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None, # Default is decided based on API choice later
+        help=f"Specific model name (e.g., '{DEFAULT_GEMINI_MODEL}', '{DEFAULT_OPENAI_MODEL}').",
+    )
+    parser.add_argument(
+        "--openai_base_url",
+        metavar="URL",
+        type=str,
+        default=None,
+        help="Optional custom base URL for the OpenAI API (e.g., for local models like Ollama). Only used if --api is 'openai'.",
+    )
     parser.add_argument(
         "--resume",
         metavar="FOLDER_PATH",
-        help="Path to an existing book project folder (e.g., '20231027-my-novel-abc123ef') to resume.",
+        help="Path to an existing book project folder to resume.",
         type=str,
         default=None,
     )
     parser.add_argument(
         "--prompt",
         metavar="FILE_PATH",
-        help="Path to a text file containing the initial book idea/prompt (used only when starting a new book).",
+        help="Path to a text file containing the initial book idea/prompt (used only for new books).",
         type=str,
         default=None,
     )
     args = parser.parse_args()
+
+    # --- Set Model Defaults ---
+    if args.model is None:
+        if args.api == 'gemini':
+            args.model = DEFAULT_GEMINI_MODEL
+        elif args.api == 'openai':
+            args.model = DEFAULT_OPENAI_MODEL
+        # Add more API defaults here if needed
+        console.print(f"[dim]No model specified, defaulting to '{args.model}' for the '{args.api}' API.[/dim]")
+
+    # Check if base URL is provided when not using OpenAI API
+    if args.openai_base_url and args.api != 'openai':
+        console.print(f"[yellow]Warning: --openai_base_url ('{args.openai_base_url}') is provided but --api is '{args.api}'. The base URL will be ignored.[/yellow]")
+        args.openai_base_url = None # Ignore it
+
 
     # --- Handle Argument Logic ---
     resume_folder_path = args.resume
@@ -2967,6 +3263,9 @@ if __name__ == "__main__":
     try:
         # Pass the parsed arguments to the NovelWriter constructor
         writer = NovelWriter(
+            api_type=args.api,
+            model_name=args.model,
+            openai_base_url=args.openai_base_url, # Pass base URL
             resume_folder_name=resume_folder_path,
             initial_prompt_file=initial_prompt_file,
         )
@@ -2976,13 +3275,20 @@ if __name__ == "__main__":
         console.print(
             f"[bold red]File Not Found Error during setup/loading: {fnf_error}[/bold red]"
         )
-    except ValueError as ve:
-        # Catch API key missing error or other init value errors
-        console.print(f"[bold red]Initialization Error: {ve}[/bold red]")
+    except (ValueError, RuntimeError) as init_error:
+        # Catch API key missing error or other init value/runtime errors (like client init failure)
+        console.print(f"[bold red]Initialization Error: {init_error}[/bold red]")
     except KeyboardInterrupt:
         console.print(
             "\n[bold yellow]Operation interrupted by user. Exiting.[/bold yellow]"
         )
+    except ImportError as import_err:
+         if 'openai' in str(import_err).lower():
+              console.print(f"[bold red]Import Error: {import_err}. Have you installed the OpenAI library? Try: pip install openai[/bold red]")
+         elif 'google.generativeai' in str(import_err).lower():
+               console.print(f"[bold red]Import Error: {import_err}. Have you installed the Google Generative AI library? Try: pip install google-generativeai[/bold red]")
+         else:
+              console.print(f"[bold red]Import Error: {import_err}. Please ensure all required libraries are installed.[/bold red]")
     except Exception as main_exception:
         console.print(
             "[bold red]An unexpected critical error occurred during execution:[/bold red]"
@@ -2990,3 +3296,4 @@ if __name__ == "__main__":
         console.print_exception(
             show_locals=False, word_wrap=True, exc_info=main_exception
         )  # Rich traceback
+
