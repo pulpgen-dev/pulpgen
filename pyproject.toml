@@ -1,0 +1,13 @@
+[project]
+name = "pulpgen"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ebooklib>=0.18",
+    "google-generativeai>=0.8.4",
+    "lxml>=5.3.2",
+    "python-dotenv>=1.1.0",
+    "rich>=14.0.0",
+]
