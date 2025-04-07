@@ -18,18 +18,19 @@
     uv sync
     ```
 2.  **API Key:** Create a `.env` file in the `pulpgen` directory with `GEMINI_API_KEY=YOUR_KEY_HERE`
-3.  
+    API Key can be created in Google AI Studio: https://aistudio.google.com/app/apikey
+
+4.  
     ```bash
     # Example using a prompt file:
     uv run python pulpgen.py --prompt your_idea.txt
     # Or run without --prompt to enter idea interactively
     ```
-    API Key can be created in Google AI Studio: https://aistudio.google.com/app/apikey
-4.  **Run (Resume Project):**
+5.  **Run (Resume Project):**
     ```bash
     uv run python pulpgen.py --resume path/to/your/project_folder
     ```
-5.  **Output:** Finds/creates a project folder (like `YYYYMMDD-slug-uuid`) containing XML state files and the final manuscript in `final.html`.
+6.  **Output:** Finds/creates a project folder (like `YYYYMMDD-slug-uuid`) containing XML state files and the final manuscript in `final.html`.
 
 ---
 
