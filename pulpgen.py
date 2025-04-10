@@ -20,7 +20,8 @@ import re
 import json
 import getpass
 import unicodedata  # For slugify
-import math  # For word count display
+import math
+import sys  # For word count display and exiting
 
 from rich.console import Console
 from rich.panel import Panel
@@ -30,6 +31,8 @@ from rich.syntax import Syntax
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from dotenv import load_dotenv
 from html import escape  # For HTML generation
+
+import markdown_exporter
 
 # --- Configuration ---
 WRITING_MODEL_NAME = "gemini-2.5-pro-exp-03-25"
@@ -2433,6 +2436,46 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
             else:
                 console.print("Suggested patch discarded.")
 
+    # --- Export Menu Handler ---
+    def _show_export_menu(self):
+        """Displays the export options and handles the user choice."""
+        console.print(Panel("Export Options", style="bold blue"))
+
+        export_options = {
+            "1": "Export Full Book (Single Markdown File)",
+            "2": "Export Chapters (Markdown File per Chapter)",
+            "3": "Return to Editing Menu",
+            "4": "Exit Program",
+        }
+
+        while True:
+            console.print("\n[bold cyan]Choose an Export Format or Action:[/bold cyan]")
+            choices = []
+            for key, desc in export_options.items():
+                console.print(f"{key}. {desc}")
+                choices.append(key)
+
+            choice = Prompt.ask(
+                "[yellow]Select option[/yellow]", choices=choices, default="3"
+            )
+
+            if choice == "1":
+                filename = f"{self.book_title_slug}-full-export.md"
+                output_path = self.book_dir / filename
+                markdown_exporter.export_single_markdown(self.book_root, output_path)
+            elif choice == "2":
+                # Pass the main book directory; the exporter function creates the subfolder
+                markdown_exporter.export_markdown_per_chapter(
+                    self.book_root, self.book_dir, self.book_title_slug
+                )
+            elif choice == "3":
+                return  # Go back to the main editing menu loop
+            elif choice == "4":
+                console.print(
+                    "[bold yellow]Exiting program as requested.[/bold yellow]"
+                )
+                sys.exit(0)  # Clean exit
+
     # --- Step 3: Editing (Main Loop) ---
     def edit_book(self):
         """Guides the user through the enhanced editing process."""
@@ -2457,7 +2500,11 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
             ),
             "4": ("Ask LLM for Edit Suggestions", self._edit_suggest_edits),
             "5": ("General Edit Request (LLM Patch)", self._edit_general_llm),
-            "6": ("Finish Editing", None),  # Use None to signal exit
+            "6": (
+                "Export Menu / Exit",
+                self._show_export_menu,
+            ),  # Changed to Export menu trigger
+            "7": ("Finish Editing", None),  # Use None to signal exit
         }
 
         while True:
@@ -2486,7 +2533,7 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
                     )
                     console.print_exception(show_locals=False, word_wrap=True)
                     console.print("[yellow]Returning to editing menu.[/yellow]")
-            elif choice == "6":  # Finish Editing
+            elif choice == "7":  # Finish Editing
                 console.print("\nFinishing editing process.")
                 return True
             else:
