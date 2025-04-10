@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 from html import escape  # For HTML generation
 
 import markdown_exporter
+import epub_exporter
 
 # --- Configuration ---
 WRITING_MODEL_NAME = "gemini-2.5-pro-exp-03-25"
@@ -2444,8 +2445,9 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
         export_options = {
             "1": "Export Full Book (Single Markdown File)",
             "2": "Export Chapters (Markdown File per Chapter)",
-            "3": "Return to Editing Menu",
-            "4": "Exit Program",
+            "3": "Export Full Book (EPUB Format)",
+            "4": "Save Final Version (final.xml & final.html)",
+            "5": "Return to Editing Menu",
         }
 
         while True:
@@ -2456,7 +2458,7 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
                 choices.append(key)
 
             choice = Prompt.ask(
-                "[yellow]Select option[/yellow]", choices=choices, default="3"
+                "[yellow]Select option[/yellow]", choices=choices, default="5"
             )
 
             if choice == "1":
@@ -2468,13 +2470,24 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
                 markdown_exporter.export_markdown_per_chapter(
                     self.book_root, self.book_dir, self.book_title_slug
                 )
-            elif choice == "3":
-                return  # Go back to the main editing menu loop
-            elif choice == "4":
-                console.print(
-                    "[bold yellow]Exiting program as requested.[/bold yellow]"
+            elif choice == "3":  # New EPUB export action
+                epub_exporter.export_epub(
+                    self.book_root, self.book_dir, self.book_title_slug
                 )
-                sys.exit(0)  # Clean exit
+            elif choice == "4":
+                console.print("[cyan]Saving final state...[/cyan]")
+                save_final_xml_ok = self._save_book_state("final.xml")
+                self._generate_html_output("final.html")
+                if save_final_xml_ok:
+                    console.print(
+                        f"[green]Final version saved as final.xml and final.html in {self.book_dir.resolve()}[/green]"
+                    )
+                else:
+                    console.print(
+                        "[bold red]Could not save final XML state (final.xml), but HTML (final.html) was generated.[/bold red]"
+                    )
+            elif choice == "5":
+                return  # Go back to the main editing menu loop
 
     # --- Step 3: Editing (Main Loop) ---
     def edit_book(self):
@@ -2500,11 +2513,8 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
             ),
             "4": ("Ask LLM for Edit Suggestions", self._edit_suggest_edits),
             "5": ("General Edit Request (LLM Patch)", self._edit_general_llm),
-            "6": (
-                "Export Menu / Exit",
-                self._show_export_menu,
-            ),  # Changed to Export menu trigger
-            "7": ("Finish Editing", None),  # Use None to signal exit
+            "6": ("Export Menu", self._show_export_menu),
+            "7": ("Quit Editing Menu", None),
         }
 
         while True:
@@ -2518,7 +2528,7 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
             choice = Prompt.ask(
                 "[yellow]Choose an editing action[/yellow]",
                 choices=choices,
-                default="6",
+                default="7",
             )
 
             desc, handler = edit_options.get(choice)
@@ -2534,7 +2544,7 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
                     console.print_exception(show_locals=False, word_wrap=True)
                     console.print("[yellow]Returning to editing menu.[/yellow]")
             elif choice == "7":  # Finish Editing
-                console.print("\nFinishing editing process.")
+                console.print("\nExiting editing menu.")
                 return True
             else:
                 console.print(
@@ -2906,51 +2916,27 @@ Generate the `<patch>` XML containing your suggested edits now. Output ONLY the 
             if not has_outline:
                 editing_run_or_skipped = True
 
-        # --- Proceed Confirmation 3 ---
-        if self.book_root is not None and self.book_dir is not None:
-            # Always ask for final save unless editing was totally skipped because no outline existed
-            if editing_run_or_skipped or chapter_gen_run_or_skipped or outline_step_run:
-                if not Confirm.ask(
-                    "\n[yellow]Editing complete (or skipped). Proceed to Final Save and HTML Generation? [/yellow]",
-                    default=True,
-                ):
-                    console.print("Skipping final save and generation as requested.")
-                    return
-            # If editing failed and user opted out, we already exited during edit loop
-            # If generation failed and user opted out, we exited there
-            # If outline failed, we exited there
+        # --- Final Save & HTML Output (REMOVED - MOVED TO EXPORT MENU) ---
+        # console.print("[cyan]Performing final save...[/cyan]")
+        # ... (removed save and html generation logic) ...
 
-        # --- Final Save & HTML Output ---
+        # --- Completion Message ---
         if self.book_root is not None and self.book_dir is not None:
-            console.print("[cyan]Performing final save...[/cyan]")
-            final_xml_filename = "final.xml"
-            save_final_xml_ok = self._save_book_state(final_xml_filename)
-            final_html_filename = (
-                "final.html"  # Overwrite final.html with the actual final state
+            console.print(
+                Panel(
+                    "[bold green]📚 Novel Writer session finished. 📚[/bold green]",
+                    border_style="green",
+                )
             )
-            self._generate_html_output(
-                final_html_filename
-            )  # This uses the current self.book_root
-
-            if save_final_xml_ok:
-                console.print(
-                    Panel(
-                        f"[bold green]🎉 Novel writing process complete! Final version saved as {final_xml_filename} and {final_html_filename}. 🎉[/bold green]",
-                        border_style="green",
-                    )
-                )
-                console.print(
-                    f"All files are located in: [cyan]{self.book_dir.resolve()}[/cyan]"
-                )
-            else:
-                console.print(
-                    f"[bold red]Could not save final XML state ({final_xml_filename}), but HTML ({final_html_filename}) was generated from current state.[/bold red]"
-                )
+            console.print(f"Project folder: [cyan]{self.book_dir.resolve()}[/cyan]")
+            console.print(
+                "Remember to use the Export Menu (Option 6 in Editing) to save final versions or export."
+            )
 
         else:
             console.print(
                 "[bold red]Could not perform final save as book data or directory is missing.[/bold red]"
-            )
+            )  # This message remains relevant if initialization failed)
 
 
 # --- Main Execution Guard ---
